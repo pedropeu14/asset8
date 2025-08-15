@@ -9,7 +9,7 @@ from scipy.optimize import minimize
 # =================== CONFIG ===================
 st.set_page_config(page_title="Asset Allocation com Fronteira Eficiente", layout="wide")
 st.title("📁 Asset Allocation com Fronteira Eficiente")
-st.caption("Build: v16.2 — Comparar Ativos: gráfico compacto, legenda fora, datas corretas + limite de 6 e botão Selecionar/Desmarcar todos")
+st.caption("Build: v16.3 — Regra 0% ou ≥1% aplicada (Retorno, Retorno+DD, GMVP e Máx.Sharpe) + comparar ativos compacto (limite 6)")
 
 # Arquivos locais
 CAMINHO_PLANILHA_ATIVOS = "ativos.xlsx"
@@ -18,7 +18,7 @@ CAMINHO_BENCHMARK      = "benchmark.xlsx"
 CAMINHO_RF             = "taxa livre de risco.xlsx"  # % a.a. (coluna numérica), 1ª coluna = Date
 
 # Regras
-MIN_PESO = 0.01  # 1% (para regra 0% OU ≥1%)
+MIN_PESO = 0.01  # 1% (regra 0% OU ≥1%)
 CLASS_ORDER = ["Caixa", "Renda Fixa", "Ações", "Commodities"]
 
 # Limite por ativo específico (AT1)
@@ -104,7 +104,7 @@ def minimize_volatility_with_constraints(mean_returns, cov_matrix, target_return
         {'type': 'eq', 'fun': lambda x, mu=mean_returns.values: np.dot(x, mu) - target_return}
     ]
     cons += class_constraints(tickers, perfil, restricoes_por_perfil, classe_ativos)
-    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)
+    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)  # lb=0 aqui; a regra ≥1% será aplicada depois
     x0 = np.ones(n) / n
     Sigma = cov_matrix.values
     obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
@@ -127,7 +127,7 @@ def gerar_fronteira_eficiente(mean_returns, cov_matrix, tickers, perfil, restric
 # ========= GMVP & Máx. Sharpe =========
 def gmvp_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por_perfil, classe_ativos):
     n = len(tickers)
-    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)
+    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)  # lb=0 aqui; regra ≥1% virá depois
     cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
     cons += class_constraints(tickers, perfil, restricoes_por_perfil, classe_ativos)
     x0 = np.ones(n)/n
@@ -141,7 +141,7 @@ def gmvp_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por_perfi
 def max_sharpe_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por_perfil, classe_ativos, rf_daily=None):
     rf_ann = 0.0 if (rf_daily is None or getattr(rf_daily, "empty", False)) else float((1 + rf_daily.mean())**252 - 1)
     n = len(tickers)
-    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)
+    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)  # lb=0 aqui; regra ≥1% virá depois
     cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
     cons += class_constraints(tickers, perfil, restricoes_por_perfil, classe_ativos)
     x0 = np.ones(n)/n
@@ -196,6 +196,74 @@ def indicadores_por_ano(portfolio_returns, rf_daily=None):
         max_dd = dd.min()
         out.append([str(ano), f"{ret*100:.2f}%", f"{vol*100:.2f}%", f"{sharpe:.2f}", f"{max_dd*100:.2f}%"])
     return pd.DataFrame(out, columns=["Ano", "Retorno", "Volatilidade", "Sharpe", "Máx. Drawdown"])
+
+# ========= ENFORCE 0% OU >=1% =========
+def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
+                 restricoes_por_perfil, classe_ativos,
+                 mode="min_vol_target", target_return=None,
+                 returns_sel=None, max_dd=None, rf_daily=None):
+    """
+    Reotimiza no subconjunto de ativos com peso >= MIN_PESO impondo lb=MIN_PESO,
+    mantendo as mesmas restrições (soma=1, classe, retorno alvo e/ou DD).
+    mode: 'min_vol_target' | 'min_vol_target_dd' | 'gmvp' | 'max_sharpe'
+    """
+    w0 = np.array(weights, float)
+    order = np.argsort(-w0)
+    ativos = list(tickers)
+
+    rf_ann = 0.0 if (rf_daily is None or getattr(rf_daily, "empty", False)) else float((1 + rf_daily.mean())**252 - 1)
+
+    def _solve_subset(idxs):
+        t_sub = [ativos[i] for i in idxs]
+        mu  = mean_returns.loc[t_sub].values
+        Sig = cov_matrix.loc[t_sub, t_sub].values
+
+        cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
+        cons += class_constraints(t_sub, perfil, restricoes_por_perfil, classe_ativos)
+        if mode in ("min_vol_target", "min_vol_target_dd"):
+            cons.append({'type': 'eq', 'fun': lambda x, mu=mu: np.dot(x, mu) - float(target_return)})
+        if mode == "min_vol_target_dd":
+            assert returns_sel is not None and max_dd is not None
+            ret_sub = returns_sel[t_sub]
+            cons.append({'type':'ineq','fun': dd_constraint_factory(ret_sub, max_dd)})
+
+        bounds = [(MIN_PESO, 1.0) for _ in t_sub]  # >=1% dentro do subset
+        x0 = np.ones(len(t_sub)) / len(t_sub)
+
+        if mode in ("min_vol_target", "min_vol_target_dd", "gmvp"):
+            obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sig, x))))
+        elif mode == "max_sharpe":
+            mu_exc = mu - rf_ann
+            def obj(x):
+                vol = float(np.sqrt(np.dot(x.T, np.dot(Sig, x))))
+                if vol <= 1e-12: return 1e6
+                return -float(np.dot(x, mu_exc)/vol)
+        else:
+            raise ValueError("mode inválido")
+
+        return minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
+
+    active = [int(i) for i in order if w0[i] >= MIN_PESO]
+    if not active:
+        active = [int(order[0])]
+
+    for k in range(len(active), len(ativos) + 1):
+        idxs = sorted(active[:k])
+        res = _solve_subset(idxs)
+        if res.success:
+            w_full = np.zeros(len(ativos))
+            for j, i in enumerate(idxs):
+                w_full[i] = res.x[j]
+            return w_full
+        if k < len(order):
+            nxt = int(order[k])
+            if nxt not in active:
+                active.append(nxt)
+
+    # fallback
+    w0[w0 < MIN_PESO] = 0.0
+    s = w0.sum()
+    return w0 / s if s > 0 else np.ones(len(ativos)) / len(ativos)
 
 def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, classe_ativos,
                      benchmark_retornos=None, benchmark_nome=None,
@@ -369,7 +437,12 @@ try:
             mean_returns, cov_matrix, retorno_alvo,
             df_sel.columns, perfil, limites_demo, classe_ativos
         )
-        pesos_otimizados = w_opt_base
+        # aplica regra 0% ou ≥1%
+        pesos_otimizados = enforce_min1(
+            w_opt_base, df_sel.columns, perfil, mean_returns, cov_matrix,
+            limites_demo, classe_ativos,
+            mode="min_vol_target", target_return=retorno_alvo, rf_daily=rf_daily
+        )
         achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
         dd_info = None
     else:
@@ -387,10 +460,16 @@ try:
         obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
         res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
         if res.success:
-            pesos_otimizados = res.x
+            pesos_otimizados = enforce_min1(
+                res.x, df_sel.columns, perfil, mean_returns, cov_matrix,
+                limites_demo, classe_ativos,
+                mode="min_vol_target_dd", target_return=retorno_alvo,
+                returns_sel=returns_sel, max_dd=max_dd_user, rf_daily=rf_daily
+            )
             achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
             dd_info = ("ok", achieved_dd)
         else:
+            # fallback MC (mantido)
             tol_bps = 25
             tol = tol_bps/10000.0
             rng = np.random.default_rng(123)
@@ -421,7 +500,13 @@ try:
                     factive.append((vol, w, mdd))
             if factive:
                 factive.sort(key=lambda x: x[0])
-                pesos_otimizados = factive[0][1]
+                w_mc = factive[0][1]
+                pesos_otimizados = enforce_min1(
+                    w_mc, df_sel.columns, perfil, mean_returns, cov_matrix,
+                    limites_demo, classe_ativos,
+                    mode="min_vol_target_dd", target_return=retorno_alvo,
+                    returns_sel=returns_sel, max_dd=max_dd_user, rf_daily=rf_daily
+                )
                 achieved_dd = factive[0][2]
                 dd_info = ("mc", achieved_dd)
                 st.info("Carteira encontrada via amostragem Monte Carlo (solver não convergiu).")
@@ -433,10 +518,20 @@ try:
     # 6) GMVP e Máx. Sharpe
     try:
         w_gmvp = gmvp_weights(mean_returns, cov_matrix, df_sel.columns, perfil, limites_demo, classe_ativos)
+        w_gmvp = enforce_min1(
+            w_gmvp, df_sel.columns, perfil, mean_returns, cov_matrix,
+            limites_demo, classe_ativos,
+            mode="gmvp", rf_daily=rf_daily
+        )
     except Exception:
         w_gmvp = None
     try:
         w_maxsh = max_sharpe_weights(mean_returns, cov_matrix, df_sel.columns, perfil, limites_demo, classe_ativos, rf_daily=rf_daily)
+        w_maxsh = enforce_min1(
+            w_maxsh, df_sel.columns, perfil, mean_returns, cov_matrix,
+            limites_demo, classe_ativos,
+            mode="max_sharpe", rf_daily=rf_daily
+        )
     except Exception:
         w_maxsh = None
 
@@ -714,7 +809,7 @@ try:
                 axc.legend(
                     loc="center left",
                     bbox_to_anchor=(1.01, 0.5),
-                    fontsize=4,
+                    fontsize=8,
                     frameon=False,
                     ncol=1,
                     handlelength=1.6,
