@@ -7,9 +7,9 @@ import matplotlib.dates as mdates
 from scipy.optimize import minimize
 
 # =================== CONFIG ===================
-st.set_page_config(page_title="Asset Allocation com Fronteira Eficiente", layout="wide")
+st.set_page_config(page_title="Fortune Financial Strategies", layout="wide")
 st.title("📁 Asset Allocation com Fronteira Eficiente")
-st.caption("Build: v16.5 — Botão de otimização via form (Retorno, Retorno+DD, GMVP, Máx.Sharpe) • benchmark não recalcula • comparar e pesos manuais independentes • cache em sessão")
+st.caption("Build: v16.5 — by Pedro Freitas de Amorim")
 
 # >>> Tolerância numérica para checagem de DD <<<
 EPS = 1e-6
