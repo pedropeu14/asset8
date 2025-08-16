@@ -124,7 +124,7 @@ def build_bounds(tickers, perfil, lower_is_minpeso: bool):
     cap_at1 = AT1_CAPS.get(perfil, 1.0)
     for t in tickers:
         ub = cap_at1 if is_at1(t) else 1.0
-    lb = MIN_PESO if lower_is_minpeso else 0.0
+        lb = MIN_PESO if lower_is_minpeso else 0.0
         bounds.append((lb, ub))
     return tuple(bounds)
 
@@ -697,7 +697,6 @@ try:
                 if modo == "ok":
                     st.success(f"Máx. Drawdown da carteira exibida: {abs(dd_val)*100:.2f}% (dentro do alvo).")
                 else:
-                    # Em v16.6 nunca mostramos violado; deixo apenas por segurança futura
                     st.warning(f"⚠️ Máx. Drawdown da carteira exibida: {abs(dd_val)*100:.2f}% — ACIMA do limite solicitado.")
 
             # -------- Tabela: Otimizada x GMVP x Máx. Sharpe x Benchmark --------
@@ -726,7 +725,7 @@ try:
             if benchmark_retornos is not None and not getattr(benchmark_retornos, "empty", True):
                 _, bench_alinh = port_opt.align(benchmark_retornos, join="inner")
                 r_b, v_b, s_b, dd_b = metrics(bench_alinh)
-                linhas.append([f"Benchmark ({benchmark_nome})", f"{r_b*100:.2f}%", f"{v_b*100:.2f}%", f"{s_b*100:.2f}" if isinstance(s_b,float) else f"{s_b:.2f}", f"{dd_b*100:.2f}%"])
+                linhas.append([f"Benchmark ({benchmark_nome})", f"{r_b*100:.2f}%", f"{v_b*100:.2f}%", f"{s_b:.2f}", f"{dd_b*100:.2f}%"])
 
             st.subheader("📑 Comparação de Métricas")
             st.dataframe(pd.DataFrame(linhas, columns=["Carteira", "Retorno (a.a.)", "Vol. (a.a.)", "Sharpe", "Máx. DD"]), use_container_width=True)
