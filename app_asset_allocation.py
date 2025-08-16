@@ -9,7 +9,7 @@ from scipy.optimize import minimize
 # =================== CONFIG ===================
 st.set_page_config(page_title="Asset Allocation com Fronteira Eficiente", layout="wide")
 st.title("📁 Asset Allocation com Fronteira Eficiente")
-st.caption("Build: v16.4 — Regra 0% ou ≥1% (Retorno, Retorno+DD, GMVP e Máx.Sharpe) + comparar ativos compacto (limite 6) • com cache e sem Monte Carlo")
+st.caption("Build: v16.5 — Regra 0% ou ≥1% (Retorno, Retorno+DD, GMVP e Máx.Sharpe) + comparar ativos compacto (limite 6) • cache reforçado (benchmark não reotimiza)")
 
 # Arquivos locais
 CAMINHO_PLANILHA_ATIVOS = "ativos.xlsx"
@@ -69,6 +69,11 @@ def compute_stats(returns_sel: pd.DataFrame):
     mean_returns = returns_sel.mean() * 252
     cov_matrix   = returns_sel.cov() * 252
     return mean_returns, cov_matrix
+
+# Hash leve e estável do DataFrame -> evita recomputar por interações leves (ex.: selectbox)
+def df_hash(df: pd.DataFrame) -> int:
+    # hash por conteúdo (inclui index)
+    return int(pd.util.hash_pandas_object(df, index=True).sum())
 
 # ================ FUNÇÕES BASE ================
 def calc_sharpe(returns, rf_daily=None):
@@ -289,7 +294,7 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
     s = w0.sum()
     return w0 / s if s > 0 else np.ones(len(ativos)) / len(ativos)
 
-# ========= CACHE para otimização principal =========
+# ========= CACHE para otimização principal (função pura) =========
 @st.cache_data(show_spinner=False)
 def otimizar_portfolio(criterio, perfil, retorno_alvo, max_dd_user,
                        df_sel_columns, mean_returns, cov_matrix,
@@ -493,34 +498,74 @@ try:
     # 4) Estatísticas (com cache)
     mean_returns, cov_matrix = compute_stats(returns_sel)
 
-    # 5) Otimização principal (com cache, sem Monte Carlo)
-    pesos_otimizados, dd_info = otimizar_portfolio(
-        criterio, perfil, retorno_alvo, max_dd_user,
-        tuple(df_sel.columns), mean_returns, cov_matrix,
-        limites_demo, classe_ativos, returns_sel, rf_daily
+    # ========= Cache reforçado em session_state (NÃO depende do benchmark) =========
+    if "opt_cache" not in st.session_state:
+        st.session_state["opt_cache"] = {}
+
+    opt_key = (
+        "v165",                         # versão do cache (mude se alterar lógica)
+        criterio,
+        perfil,
+        float(retorno_alvo),
+        float(max_dd_user) if max_dd_user is not None else -1.0,
+        tuple(df_sel.columns),
+        df_hash(returns_sel),
+        df_hash(mean_returns.to_frame().T),  # inclui mudanças em estatísticas
+        df_hash(cov_matrix)                  # idem
     )
 
-    # 6) GMVP e Máx. Sharpe
-    try:
-        w_gmvp = gmvp_weights(mean_returns, cov_matrix, df_sel.columns, perfil, limites_demo, classe_ativos)
-        w_gmvp = enforce_min1(
-            w_gmvp, df_sel.columns, perfil, mean_returns, cov_matrix,
-            limites_demo, classe_ativos,
-            mode="gmvp", rf_daily=rf_daily
+    cache_hit = opt_key in st.session_state["opt_cache"]
+    if not cache_hit:
+        # 5) Otimização principal
+        pesos_otimizados, dd_info = otimizar_portfolio(
+            criterio, perfil, retorno_alvo, max_dd_user,
+            tuple(df_sel.columns), mean_returns, cov_matrix,
+            limites_demo, classe_ativos, returns_sel, rf_daily
         )
-    except Exception:
-        w_gmvp = None
-    try:
-        w_maxsh = max_sharpe_weights(mean_returns, cov_matrix, df_sel.columns, perfil, limites_demo, classe_ativos, rf_daily=rf_daily)
-        w_maxsh = enforce_min1(
-            w_maxsh, df_sel.columns, perfil, mean_returns, cov_matrix,
-            limites_demo, classe_ativos,
-            mode="max_sharpe", rf_daily=rf_daily
-        )
-    except Exception:
-        w_maxsh = None
 
-    # 7) Benchmark (com cache)
+        # 6) GMVP e Máx. Sharpe
+        try:
+            w_gmvp = gmvp_weights(mean_returns, cov_matrix, df_sel.columns, perfil, limites_demo, classe_ativos)
+            w_gmvp = enforce_min1(
+                w_gmvp, df_sel.columns, perfil, mean_returns, cov_matrix,
+                limites_demo, classe_ativos,
+                mode="gmvp", rf_daily=rf_daily
+            )
+        except Exception:
+            w_gmvp = None
+        try:
+            w_maxsh = max_sharpe_weights(mean_returns, cov_matrix, df_sel.columns, perfil, limites_demo, classe_ativos, rf_daily=rf_daily)
+            w_maxsh = enforce_min1(
+                w_maxsh, df_sel.columns, perfil, mean_returns, cov_matrix,
+                limites_demo, classe_ativos,
+                mode="max_sharpe", rf_daily=rf_daily
+            )
+        except Exception:
+            w_maxsh = None
+
+        # 8) Fronteira
+        frontier_rets, frontier_vols = gerar_fronteira_eficiente(
+            mean_returns, cov_matrix, tuple(df_sel.columns), perfil, limites_demo, classe_ativos
+        )
+
+        st.session_state["opt_cache"][opt_key] = {
+            "pesos_otimizados": pesos_otimizados,
+            "dd_info": dd_info,
+            "w_gmvp": w_gmvp,
+            "w_maxsh": w_maxsh,
+            "frontier_rets": frontier_rets,
+            "frontier_vols": frontier_vols
+        }
+    # Recupera do cache (nenhum recompute pesado aqui)
+    cached = st.session_state["opt_cache"][opt_key]
+    pesos_otimizados = cached["pesos_otimizados"]
+    dd_info = cached["dd_info"]
+    w_gmvp = cached["w_gmvp"]
+    w_maxsh = cached["w_maxsh"]
+    frontier_rets = cached["frontier_rets"]
+    frontier_vols = cached["frontier_vols"]
+
+    # 7) Benchmark (com cache de leitura de arquivo)
     bench_series = {}
     if os.path.exists(CAMINHO_BENCHMARK):
         try:
@@ -536,11 +581,6 @@ try:
                     bench_series[c] = bench[c].pct_change().dropna()
         except Exception:
             pass
-
-    # 8) Fronteira (com cache)
-    frontier_rets, frontier_vols = gerar_fronteira_eficiente(
-        mean_returns, cov_matrix, tuple(df_sel.columns), perfil, limites_demo, classe_ativos
-    )
 
     # 9) OTIMIZAÇÃO (gráficos + comparações)
     with tab_otm:
