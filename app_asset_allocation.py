@@ -9,7 +9,7 @@ from scipy.optimize import minimize
 # =================== CONFIG ===================
 st.set_page_config(page_title="Asset Allocation com Fronteira Eficiente", layout="wide")
 st.title("📁 Asset Allocation com Fronteira Eficiente")
-st.caption("Build: v16.3 — Regra 0% ou ≥1% aplicada (Retorno, Retorno+DD, GMVP e Máx.Sharpe) + comparar ativos compacto (limite 6)")
+st.caption("Build: v16.3 — Sem Monte Carlo + Botão Calcular + Cache de dados/estatísticas")
 
 # Arquivos locais
 CAMINHO_PLANILHA_ATIVOS = "ativos.xlsx"
@@ -18,7 +18,7 @@ CAMINHO_BENCHMARK      = "benchmark.xlsx"
 CAMINHO_RF             = "taxa livre de risco.xlsx"  # % a.a. (coluna numérica), 1ª coluna = Date
 
 # Regras
-MIN_PESO = 0.01  # 1% (regra 0% OU ≥1%)
+MIN_PESO = 0.01  # 1% (para regra 0% OU ≥1%)
 CLASS_ORDER = ["Caixa", "Renda Fixa", "Ações", "Commodities"]
 
 # Limite por ativo específico (AT1)
@@ -34,9 +34,40 @@ def is_at1(ticker: str) -> bool:
 # Classes consideradas "Caixa"
 CASH_CLASS_ALIASES = {"Caixa", "Cash"}
 
-# ================ FUNÇÕES BASE ================
-def load_risk_free(source, dayfirst=True):
-    rf = pd.read_excel(source)
+# ================ FUNÇÕES CACHEADAS ================
+@st.cache_data(show_spinner=False)
+def _read_excel_cached(path, dayfirst=True):
+    df = pd.read_excel(path)
+    if "Date" not in df.columns:
+        df.rename(columns={df.columns[0]: "Date"}, inplace=True)
+    df["Date"] = pd.to_datetime(df["Date"], dayfirst=dayfirst, errors="coerce")
+    df = df.dropna(subset=["Date"]).set_index("Date").sort_index().ffill()
+    return df
+
+@st.cache_data(show_spinner=False)
+def _compute_returns_and_stats(df_prices: pd.DataFrame):
+    returns = df_prices.pct_change().dropna()
+    mean_returns = returns.mean() * 252
+    cov_matrix   = returns.cov() * 252
+    return returns, mean_returns, cov_matrix
+
+@st.cache_data(show_spinner=False)
+def _read_classes_cached(path):
+    d = pd.read_excel(path)
+    return dict(zip(d["Ativo"], d["Classe"]))
+
+@st.cache_data(show_spinner=False)
+def _read_benchmark_cached(path, dayfirst=True):
+    bench_series = {}
+    bench = _read_excel_cached(path, dayfirst=dayfirst)
+    for c in bench.columns:
+        if c.lower() != "date" and pd.api.types.is_numeric_dtype(bench[c]):
+            bench_series[c] = bench[c].pct_change().dropna()
+    return bench_series
+
+@st.cache_data(show_spinner=False)
+def _read_risk_free_cached(path, dayfirst=True):
+    rf = pd.read_excel(path)
     rf.columns = rf.columns.astype(str).str.strip()
     taxa_cols = [c for c in rf.columns if c.lower() != "date" and pd.api.types.is_numeric_dtype(rf[c])]
     if not taxa_cols:
@@ -47,6 +78,7 @@ def load_risk_free(source, dayfirst=True):
     rf_daily = (1 + rf[col] / 100.0) ** (1/252) - 1
     return rf_daily
 
+# ================ FUNÇÕES BASE ================
 def calc_sharpe(returns, rf_daily=None):
     if rf_daily is None or (hasattr(rf_daily, "empty") and getattr(rf_daily, "empty", False)):
         ret_ann = (1 + returns.mean())**252 - 1
@@ -104,7 +136,7 @@ def minimize_volatility_with_constraints(mean_returns, cov_matrix, target_return
         {'type': 'eq', 'fun': lambda x, mu=mean_returns.values: np.dot(x, mu) - target_return}
     ]
     cons += class_constraints(tickers, perfil, restricoes_por_perfil, classe_ativos)
-    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)  # lb=0 aqui; a regra ≥1% será aplicada depois
+    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)
     x0 = np.ones(n) / n
     Sigma = cov_matrix.values
     obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
@@ -127,7 +159,7 @@ def gerar_fronteira_eficiente(mean_returns, cov_matrix, tickers, perfil, restric
 # ========= GMVP & Máx. Sharpe =========
 def gmvp_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por_perfil, classe_ativos):
     n = len(tickers)
-    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)  # lb=0 aqui; regra ≥1% virá depois
+    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)
     cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
     cons += class_constraints(tickers, perfil, restricoes_por_perfil, classe_ativos)
     x0 = np.ones(n)/n
@@ -140,11 +172,11 @@ def gmvp_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por_perfi
 
 def max_sharpe_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por_perfil, classe_ativos, rf_daily=None):
     rf_ann = 0.0 if (rf_daily is None or getattr(rf_daily, "empty", False)) else float((1 + rf_daily.mean())**252 - 1)
-    n = len(tickers)
-    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)  # lb=0 aqui; regra ≥1% virá depois
+    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)
     cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
     cons += class_constraints(tickers, perfil, restricoes_por_perfil, classe_ativos)
-    x0 = np.ones(n)/n
+    x0 = np.ones(len(tickers))/len(tickers)
+
     mu = mean_returns.values
     Sigma = cov_matrix.values
     mu_excess = mu - rf_ann
@@ -197,74 +229,6 @@ def indicadores_por_ano(portfolio_returns, rf_daily=None):
         out.append([str(ano), f"{ret*100:.2f}%", f"{vol*100:.2f}%", f"{sharpe:.2f}", f"{max_dd*100:.2f}%"])
     return pd.DataFrame(out, columns=["Ano", "Retorno", "Volatilidade", "Sharpe", "Máx. Drawdown"])
 
-# ========= ENFORCE 0% OU >=1% =========
-def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
-                 restricoes_por_perfil, classe_ativos,
-                 mode="min_vol_target", target_return=None,
-                 returns_sel=None, max_dd=None, rf_daily=None):
-    """
-    Reotimiza no subconjunto de ativos com peso >= MIN_PESO impondo lb=MIN_PESO,
-    mantendo as mesmas restrições (soma=1, classe, retorno alvo e/ou DD).
-    mode: 'min_vol_target' | 'min_vol_target_dd' | 'gmvp' | 'max_sharpe'
-    """
-    w0 = np.array(weights, float)
-    order = np.argsort(-w0)
-    ativos = list(tickers)
-
-    rf_ann = 0.0 if (rf_daily is None or getattr(rf_daily, "empty", False)) else float((1 + rf_daily.mean())**252 - 1)
-
-    def _solve_subset(idxs):
-        t_sub = [ativos[i] for i in idxs]
-        mu  = mean_returns.loc[t_sub].values
-        Sig = cov_matrix.loc[t_sub, t_sub].values
-
-        cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
-        cons += class_constraints(t_sub, perfil, restricoes_por_perfil, classe_ativos)
-        if mode in ("min_vol_target", "min_vol_target_dd"):
-            cons.append({'type': 'eq', 'fun': lambda x, mu=mu: np.dot(x, mu) - float(target_return)})
-        if mode == "min_vol_target_dd":
-            assert returns_sel is not None and max_dd is not None
-            ret_sub = returns_sel[t_sub]
-            cons.append({'type':'ineq','fun': dd_constraint_factory(ret_sub, max_dd)})
-
-        bounds = [(MIN_PESO, 1.0) for _ in t_sub]  # >=1% dentro do subset
-        x0 = np.ones(len(t_sub)) / len(t_sub)
-
-        if mode in ("min_vol_target", "min_vol_target_dd", "gmvp"):
-            obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sig, x))))
-        elif mode == "max_sharpe":
-            mu_exc = mu - rf_ann
-            def obj(x):
-                vol = float(np.sqrt(np.dot(x.T, np.dot(Sig, x))))
-                if vol <= 1e-12: return 1e6
-                return -float(np.dot(x, mu_exc)/vol)
-        else:
-            raise ValueError("mode inválido")
-
-        return minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
-
-    active = [int(i) for i in order if w0[i] >= MIN_PESO]
-    if not active:
-        active = [int(order[0])]
-
-    for k in range(len(active), len(ativos) + 1):
-        idxs = sorted(active[:k])
-        res = _solve_subset(idxs)
-        if res.success:
-            w_full = np.zeros(len(ativos))
-            for j, i in enumerate(idxs):
-                w_full[i] = res.x[j]
-            return w_full
-        if k < len(order):
-            nxt = int(order[k])
-            if nxt not in active:
-                active.append(nxt)
-
-    # fallback
-    w0[w0 < MIN_PESO] = 0.0
-    s = w0.sum()
-    return w0 / s if s > 0 else np.ones(len(ativos)) / len(ativos)
-
 def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, classe_ativos,
                      benchmark_retornos=None, benchmark_nome=None,
                      mostrar_fronteira=False, frontier_vols=None, frontier_returns=None,
@@ -291,7 +255,7 @@ def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, class
         if not dados.empty:
             ax.pie(dados["Peso (%)"], labels=dados["Ativo"], autopct="%1.1f%%", startangle=90)
         ax.axis("equal"); ax.set_title("Gráfico de Pizza")
-        st.pyplot(fig)
+        st.pyplot(fig); plt.close(fig)
 
     with c2:
         fig2, ax2 = plt.subplots(figsize=(5, 3.2))
@@ -300,7 +264,7 @@ def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, class
             port_alinh, bench_alinh = portfolio_returns.align(benchmark_retornos, join="inner")
             (1 + bench_alinh).cumprod().plot(ax=ax2, ls="--", lw=1.5, label=(benchmark_nome or "Benchmark"))
         ax2.set_title("Evolução do Portfólio"); ax2.legend()
-        st.pyplot(fig2)
+        st.pyplot(fig2); plt.close(fig2)
 
     with c3:
         fig3, ax3 = plt.subplots(figsize=(5, 3.2))
@@ -316,7 +280,7 @@ def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, class
             ax3.set_title("Fronteira Eficiente")
         else:
             ax3.axis("off")
-        st.pyplot(fig3)
+        st.pyplot(fig3); plt.close(fig3)
 
     st.subheader("📊 Indicadores de Performance Totais")
     ann_return, ann_vol, sharpe, max_dd = indicadores_totais(portfolio_returns, rf_daily)
@@ -340,6 +304,9 @@ max_dd_user = None
 if criterio == "Retorno alvo + Máx. DD":
     max_dd_user = st.sidebar.slider("📉 Máx. Drawdown permitido (%)", 1.0, 50.0, 20.0, 0.5) / 100
 
+# Botão para evitar reruns pesados a cada clique
+recalcular = st.sidebar.button("⚡ Calcular/Atualizar")
+
 # Limites por perfil
 limites_demo = {
     "Conservador": {"Caixa": (0, 1.0), "Ações": (0, 0.2), "Commodities": (0, 0.05), "Renda Fixa": (0.0, 1.0)},
@@ -362,27 +329,16 @@ st.sidebar.write(f"*{AT1_TICKER_EXATO} — teto por ativo*: até {int(AT1_CAPS[p
 
 # ================ PIPELINE ================
 try:
-    # 1) Preços
-    df = pd.read_excel(CAMINHO_PLANILHA_ATIVOS)
+    # 1) Preços (cache)
+    df = _read_excel_cached(CAMINHO_PLANILHA_ATIVOS, dayfirst=True)
     if df.shape[1] == 0:
         st.error("A planilha de ativos não possui colunas."); st.stop()
-    if "Date" not in df.columns:
-        df.rename(columns={df.columns[0]: "Date"}, inplace=True)
-    df["Date"] = pd.to_datetime(df["Date"], dayfirst=True, errors="coerce")
-    df = df.dropna(subset=["Date"]).set_index("Date").sort_index().ffill()
-    returns = df.pct_change().dropna()
 
-    # 2) RF (opcional)
-    rf_daily = None
-    if os.path.exists(CAMINHO_RF):
-        try:
-            rf_daily = load_risk_free(CAMINHO_RF, dayfirst=True)
-        except Exception:
-            rf_daily = None
+    # 2) RF (opcional, cache)
+    rf_daily = _read_risk_free_cached(CAMINHO_RF, dayfirst=True) if os.path.exists(CAMINHO_RF) else None
 
-    # 3) Classes
-    df_classes = pd.read_excel(CAMINHO_CLASSIFICACAO)
-    classe_ativos = dict(zip(df_classes["Ativo"], df_classes["Classe"]))
+    # 3) Classes (cache)
+    classe_ativos = _read_classes_cached(CAMINHO_CLASSIFICACAO)
 
     # ------------------- ABAS -------------------
     tab_sel, tab_otm, tab_manual, tab_comp = st.tabs(["Seleção", "Otimização", "Pesos manuais", "Comparar Ativos"])
@@ -422,142 +378,76 @@ try:
     # aplica seleção
     ativos_ok = st.session_state.get("ativos_selecionados", list(df.columns)) or list(df.columns)
     df_sel = df[ativos_ok].copy()
-    returns_sel = returns[ativos_ok].copy()
+
+    # 4) Estatísticas (cache)
+    returns, mean_returns, cov_matrix = _compute_returns_and_stats(df)
+    returns_sel = returns[ativos_ok].dropna(how="all")
     if df_sel.empty or returns_sel.empty:
         st.error("❌ Nenhum ativo válido foi encontrado. Verifique a seleção/planilha.")
         st.stop()
 
-    # 4) Estatísticas
-    mean_returns = returns_sel.mean() * 252
-    cov_matrix   = returns_sel.cov() * 252
+    # 7) Benchmark (cache)
+    bench_series = _read_benchmark_cached(CAMINHO_BENCHMARK, dayfirst=True) if os.path.exists(CAMINHO_BENCHMARK) else {}
 
-    # 5) Otimização principal (do portfólio exibido)
-    if criterio == "Retorno alvo":
-        w_opt_base = minimize_volatility_with_constraints(
-            mean_returns, cov_matrix, retorno_alvo,
-            df_sel.columns, perfil, limites_demo, classe_ativos
-        )
-        # aplica regra 0% ou ≥1%
-        pesos_otimizados = enforce_min1(
-            w_opt_base, df_sel.columns, perfil, mean_returns, cov_matrix,
-            limites_demo, classe_ativos,
-            mode="min_vol_target", target_return=retorno_alvo, rf_daily=rf_daily
-        )
-        achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
-        dd_info = None
-    else:
-        n = len(df_sel.columns)
-        bounds = build_bounds(df_sel.columns, perfil, lower_is_minpeso=False)
-        Sigma = cov_matrix.values
-        mu = mean_returns.values
-        x0 = np.ones(n)/n
-        cons = [
-            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
-            {'type': 'eq', 'fun': lambda x, mu=mu: np.dot(x, mu) - retorno_alvo},
-            {'type': 'ineq','fun': dd_constraint_factory(returns_sel, max_dd_user)}
-        ]
-        cons += class_constraints(df_sel.columns, perfil, limites_demo, classe_ativos)
-        obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
-        res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
-        if res.success:
-            pesos_otimizados = enforce_min1(
-                res.x, df_sel.columns, perfil, mean_returns, cov_matrix,
-                limites_demo, classe_ativos,
-                mode="min_vol_target_dd", target_return=retorno_alvo,
-                returns_sel=returns_sel, max_dd=max_dd_user, rf_daily=rf_daily
+    # ---------- ABA OTIMIZAÇÃO ----------
+    with tab_otm:
+        # Só roda se clicar no botão
+        if not recalcular:
+            st.info("Aperte **Calcular/Atualizar** para rodar as otimizações.")
+            st.stop()
+
+        # 5) Otimização principal (do portfólio exibido) — sem Monte Carlo
+        if criterio == "Retorno alvo":
+            w_opt_base = minimize_volatility_with_constraints(
+                mean_returns.loc[df_sel.columns], cov_matrix.loc[df_sel.columns, df_sel.columns], retorno_alvo,
+                df_sel.columns, perfil, limites_demo, classe_ativos
             )
+            pesos_otimizados = w_opt_base
             achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
-            dd_info = ("ok", achieved_dd)
+            dd_info = None
         else:
-            # fallback MC (mantido)
-            tol_bps = 25
-            tol = tol_bps/10000.0
-            rng = np.random.default_rng(123)
-            classes_series = pd.Series([classe_ativos.get(t, "Outros") for t in df_sel.columns], index=df_sel.columns)
-            class_limits = limites_demo[perfil]
-            at1_idx = next((i for i,t in enumerate(df_sel.columns) if is_at1(t)), None)
-            def respects_class_caps(w):
-                for classe,(mn,mx) in class_limits.items():
-                    idxs = [i for i,t in enumerate(df_sel.columns) if classes_series[t]==classe]
-                    if idxs:
-                        s = w[idxs].sum()
-                        if s < mn-1e-9 or s > mx+1e-9: return False
-                return True
-            def respects_at1_cap(w):
-                if at1_idx is None: return True
-                return w[at1_idx] <= AT1_CAPS.get(perfil,1.0)+1e-12
-
-            factive = []
-            for _ in range(20000):
-                w = rng.dirichlet(np.ones(n))
-                if not respects_class_caps(w): continue
-                if not respects_at1_cap(w):   continue
-                r = float(np.dot(w, mu))
-                if abs(r - retorno_alvo) > tol: continue
-                mdd, pr = max_drawdown_of_weights(w, returns_sel)
-                if abs(mdd) <= max_dd_user + 1e-12:
-                    vol = pr.std()*np.sqrt(252)
-                    factive.append((vol, w, mdd))
-            if factive:
-                factive.sort(key=lambda x: x[0])
-                w_mc = factive[0][1]
-                pesos_otimizados = enforce_min1(
-                    w_mc, df_sel.columns, perfil, mean_returns, cov_matrix,
-                    limites_demo, classe_ativos,
-                    mode="min_vol_target_dd", target_return=retorno_alvo,
-                    returns_sel=returns_sel, max_dd=max_dd_user, rf_daily=rf_daily
-                )
-                achieved_dd = factive[0][2]
-                dd_info = ("mc", achieved_dd)
-                st.info("Carteira encontrada via amostragem Monte Carlo (solver não convergiu).")
+            n = len(df_sel.columns)
+            bounds = build_bounds(df_sel.columns, perfil, lower_is_minpeso=False)
+            Sigma = cov_matrix.loc[df_sel.columns, df_sel.columns].values
+            mu = mean_returns.loc[df_sel.columns].values
+            x0 = np.ones(n)/n
+            cons = [
+                {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+                {'type': 'eq', 'fun': lambda x, mu=mu: np.dot(x, mu) - retorno_alvo},
+                {'type': 'ineq','fun': dd_constraint_factory(returns_sel[df_sel.columns], max_dd_user)}
+            ]
+            cons += class_constraints(df_sel.columns, perfil, limites_demo, classe_ativos)
+            obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
+            res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
+            if res.success:
+                pesos_otimizados = res.x
+                achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel[df_sel.columns])
+                dd_info = ("ok", achieved_dd)
             else:
-                st.error("❌ Nenhuma carteira factível encontrada para **Retorno alvo + Máx. DD** "
-                         "(tente relaxar o DD, ajustar limites por classe, incluir Caixa ou ampliar tolerância).")
+                # >>> MONTE CARLO REMOVIDO <<<
+                st.error("❌ Solver não encontrou solução factível para **Retorno alvo + Máx. DD** "
+                         "(tente relaxar o DD, ajustar limites por classe, incluir Caixa ou alterar o retorno alvo).")
                 st.stop()
 
-    # 6) GMVP e Máx. Sharpe
-    try:
-        w_gmvp = gmvp_weights(mean_returns, cov_matrix, df_sel.columns, perfil, limites_demo, classe_ativos)
-        w_gmvp = enforce_min1(
-            w_gmvp, df_sel.columns, perfil, mean_returns, cov_matrix,
-            limites_demo, classe_ativos,
-            mode="gmvp", rf_daily=rf_daily
-        )
-    except Exception:
-        w_gmvp = None
-    try:
-        w_maxsh = max_sharpe_weights(mean_returns, cov_matrix, df_sel.columns, perfil, limites_demo, classe_ativos, rf_daily=rf_daily)
-        w_maxsh = enforce_min1(
-            w_maxsh, df_sel.columns, perfil, mean_returns, cov_matrix,
-            limites_demo, classe_ativos,
-            mode="max_sharpe", rf_daily=rf_daily
-        )
-    except Exception:
-        w_maxsh = None
-
-    # 7) Benchmark
-    bench_series = {}
-    if os.path.exists(CAMINHO_BENCHMARK):
+        # 6) GMVP e Máx. Sharpe
         try:
-            bench = pd.read_excel(CAMINHO_BENCHMARK)
-            bench.columns = bench.columns.astype(str).str.strip()
-            if "Date" not in bench.columns and bench.shape[1] > 0:
-                bench.rename(columns={bench.columns[0]: "Date"}, inplace=True)
-            bench["Date"] = pd.to_datetime(bench["Date"], dayfirst=True, errors="coerce")
-            bench = bench.dropna(subset=["Date"]).set_index("Date").sort_index().ffill()
-            for c in bench.columns:
-                if c.lower() != "date" and pd.api.types.is_numeric_dtype(bench[c]):
-                    bench_series[c] = bench[c].pct_change().dropna()
+            w_gmvp = gmvp_weights(mean_returns.loc[df_sel.columns], cov_matrix.loc[df_sel.columns, df_sel.columns],
+                                  df_sel.columns, perfil, limites_demo, classe_ativos)
         except Exception:
-            pass
+            w_gmvp = None
+        try:
+            w_maxsh = max_sharpe_weights(mean_returns.loc[df_sel.columns], cov_matrix.loc[df_sel.columns, df_sel.columns],
+                                         df_sel.columns, perfil, limites_demo, classe_ativos, rf_daily=rf_daily)
+        except Exception:
+            w_maxsh = None
 
-    # 8) Fronteira
-    frontier_rets, frontier_vols = gerar_fronteira_eficiente(
-        mean_returns, cov_matrix, df_sel.columns, perfil, limites_demo, classe_ativos
-    )
+        # 8) Fronteira (sem cache, mas só roda após botão)
+        frontier_rets, frontier_vols = gerar_fronteira_eficiente(
+            mean_returns.loc[df_sel.columns], cov_matrix.loc[df_sel.columns, df_sel.columns],
+            df_sel.columns, perfil, limites_demo, classe_ativos
+        )
 
-    # 9) OTIMIZAÇÃO (gráficos + comparações)
-    with tab_otm:
+        # 9) Render + comparação
         nomes_bench = ["(Sem benchmark)"] + list(bench_series.keys())
         if "bench_sel" not in st.session_state:
             st.session_state["bench_sel"] = nomes_bench[0]
@@ -580,9 +470,9 @@ try:
         render_dashboard(
             pesos=pesos_otimizados,
             titulo=subt,
-            returns=returns_sel,
-            mean_returns=mean_returns,
-            cov_matrix=cov_matrix,
+            returns=returns_sel[df_sel.columns],
+            mean_returns=mean_returns.loc[df_sel.columns],
+            cov_matrix=cov_matrix.loc[df_sel.columns, df_sel.columns],
             df=df_sel,
             classe_ativos=classe_ativos,
             benchmark_retornos=benchmark_retornos,
@@ -598,8 +488,6 @@ try:
             modo, dd_val = dd_info
             if modo == "ok":
                 st.success(f"Máx. Drawdown da carteira exibida: {dd_val*100:.2f}% (dentro do alvo).")
-            elif modo == "mc":
-                st.info(f"Máx. Drawdown (via Monte Carlo): {dd_val*100:.2f}% (dentro do alvo).")
 
         # -------- Tabela: Otimizada x GMVP x Máx. Sharpe x Benchmark --------
         def metrics(s):
@@ -610,18 +498,17 @@ try:
             return r, v, sh, mdd
 
         linhas = []
-        port_opt = (returns_sel * pesos_otimizados).sum(axis=1)
+        port_opt = (returns_sel[df_sel.columns] * pesos_otimizados).sum(axis=1)
         r_o, v_o, s_o, dd_o = metrics(port_opt)
         linhas.append(["Otimizada", f"{r_o*100:.2f}%", f"{v_o*100:.2f}%", f"{s_o:.2f}", f"{dd_o*100:.2f}%"])
 
         if w_gmvp is not None:
-            port_g = (returns_sel * w_gmvp).sum(axis=1)
+            port_g = (returns_sel[df_sel.columns] * w_gmvp).sum(axis=1)
             r_g, v_g, s_g, dd_g = metrics(port_g)
             linhas.append(["GMVP", f"{r_g*100:.2f}%", f"{v_g*100:.2f}%", f"{s_g:.2f}", f"{dd_g*100:.2f}%"])
 
-        port_m = None
         if w_maxsh is not None:
-            port_m = (returns_sel * w_maxsh).sum(axis=1)
+            port_m = (returns_sel[df_sel.columns] * w_maxsh).sum(axis=1)
             r_m, v_m, s_m, dd_m = metrics(port_m)
             linhas.append(["Máx. Sharpe", f"{r_m*100:.2f}%", f"{v_m*100:.2f}%", f"{s_m:.2f}", f"{dd_m*100:.2f}%"])
 
@@ -633,21 +520,7 @@ try:
         st.subheader("📑 Comparação de Métricas")
         st.dataframe(pd.DataFrame(linhas, columns=["Carteira", "Retorno (a.a.)", "Vol. (a.a.)", "Sharpe", "Máx. DD"]), use_container_width=True)
 
-        if w_maxsh is not None:
-            st.subheader("🟢 Pesos — Carteira de Máximo Sharpe")
-            cols_ord = sort_columns_by_class(df_sel.columns, classe_ativos)
-            w_series = pd.Series(w_maxsh, index=df_sel.columns).reindex(cols_ord).fillna(0.0)
-            df_pesos_ms = pd.DataFrame({
-                "Ativo": w_series.index,
-                "Classe": [classe_ativos.get(t, "Outros") for t in w_series.index],
-                "Peso (%)": (w_series.values * 100).round(2)
-            })
-            st.dataframe(df_pesos_ms[df_pesos_ms["Peso (%)"] > 0], use_container_width=True)
-
-            st.subheader("📆 Indicadores por Ano — Máximo Sharpe")
-            st.dataframe(indicadores_por_ano(port_m, rf_daily), use_container_width=True)
-
-    # 10) PESOS MANUAIS
+    # ---------- ABA PESOS MANUAIS ----------
     with tab_manual:
         nomes_bench = ["(Sem benchmark)"] + list(bench_series.keys())
         bench_escolhido = st.selectbox("Benchmark de comparação", nomes_bench,
@@ -698,9 +571,9 @@ try:
             render_dashboard(
                 pesos=pesos_man,
                 titulo="📊 Carteira com Pesos Manuais",
-                returns=returns_sel,
-                mean_returns=mean_returns,
-                cov_matrix=cov_matrix,
+                returns=returns_sel[df_sel.columns],
+                mean_returns=mean_returns.loc[df_sel.columns],
+                cov_matrix=cov_matrix.loc[df_sel.columns, df_sel.columns],
                 df=df_sel,
                 classe_ativos=classe_ativos,
                 benchmark_retornos=benchmark_retornos,
@@ -711,7 +584,7 @@ try:
 
             if benchmark_retornos is not None and not getattr(benchmark_retornos, "empty", True):
                 st.subheader("📊 Comparação com Benchmark (Pesos Manuais)")
-                port_ret_manual = (returns_sel * pesos_man).sum(axis=1)
+                port_ret_manual = (returns_sel[df_sel.columns] * pesos_man).sum(axis=1)
                 port_alinh, bench_alinh = port_ret_manual.align(benchmark_retornos, join="inner")
 
                 def _metrics_cmp(s):
@@ -733,7 +606,7 @@ try:
                 })
                 st.dataframe(comp_manual, use_container_width=True)
 
-    # 11) COMPARAR ATIVOS (GRÁFICO COMPACTO + LIMITE 6 + TOGGLE ALL)
+    # ---------- ABA COMPARAR ATIVOS ----------
     with tab_comp:
         st.subheader("Comparar Ativos")
 
@@ -816,7 +689,7 @@ try:
                 )
                 axc.set_xlabel("")
                 axc.set_ylabel("")
-                st.pyplot(figc)
+                st.pyplot(figc); plt.close(figc)
 
                 linhas = []
                 for c in ativos_comp:
