@@ -9,7 +9,7 @@ from scipy.optimize import minimize
 # =================== CONFIG ===================
 st.set_page_config(page_title="Fortune Financial Strategies - Asset Allocation", layout="wide")
 st.title("Fortune Financial Strategies - Asset Allocation")
-st.caption("Build: v16.5 — by Pedro Freitas de Amorim")
+st.caption("Build: v16.6 — by Pedro Freitas de Amorim (DD hard constraint, multi-start)")
 
 # >>> Tolerância numérica para checagem de DD <<<
 EPS = 1e-6
@@ -22,7 +22,7 @@ if "last_otm_key" not in st.session_state:
 
 def make_cache_key(ativos_ok, perfil, criterio, retorno_alvo, max_dd_user):
     return (
-        "v16.5-session",                      # versão do cache
+        "v16.6-session",                      # versão do cache (bump para evitar cache antigo)
         tuple(ativos_ok),                     # ordem dos ativos
         perfil,
         criterio,
@@ -124,7 +124,7 @@ def build_bounds(tickers, perfil, lower_is_minpeso: bool):
     cap_at1 = AT1_CAPS.get(perfil, 1.0)
     for t in tickers:
         ub = cap_at1 if is_at1(t) else 1.0
-        lb = MIN_PESO if lower_is_minpeso else 0.0
+    lb = MIN_PESO if lower_is_minpeso else 0.0
         bounds.append((lb, ub))
     return tuple(bounds)
 
@@ -137,9 +137,10 @@ def max_drawdown_of_weights(w, returns_df):
     return float(dd.min()), pr
 
 def dd_constraint_factory(returns_df, dd_max):
-    return lambda x: dd_max - abs(max_drawdown_of_weights(x, returns_df)[0])  # g(x) >= 0
+    # dd_min é negativo; queremos -dd_min <= dd_max  <=>  dd_max + dd_min >= 0
+    return lambda x: dd_max + max_drawdown_of_weights(x, returns_df)[0]  # g(x) >= 0
 
-# ---- Otimizadores
+# ---- Otimizadores base (sem DD) ----
 def minimize_volatility_with_constraints(mean_returns, cov_matrix, target_return, tickers, perfil, restricoes_por_perfil, classe_ativos):
     n = len(tickers)
     cons = [
@@ -151,7 +152,8 @@ def minimize_volatility_with_constraints(mean_returns, cov_matrix, target_return
     x0 = np.ones(n) / n
     Sigma = cov_matrix.values
     obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
-    res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
+    res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons,
+                   options={"maxiter": 2000, "ftol": 1e-12})
     if not res.success:
         raise ValueError("Otimização falhou para o retorno alvo informado.")
     return res.x
@@ -176,7 +178,8 @@ def gmvp_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por_perfi
     x0 = np.ones(n)/n
     Sigma = cov_matrix.values
     obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
-    res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
+    res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons,
+                   options={"maxiter": 2000, "ftol": 1e-12})
     if not res.success:
         raise ValueError("Falha na otimização GMVP.")
     return res.x
@@ -196,7 +199,8 @@ def max_sharpe_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por
         vol = float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
         if vol <= 1e-12: return 1e6
         return -float(np.dot(x, mu_excess)/vol)
-    res = minimize(neg_sharpe, x0, method="SLSQP", bounds=bounds, constraints=cons)
+    res = minimize(neg_sharpe, x0, method="SLSQP", bounds=bounds, constraints=cons,
+                   options={"maxiter": 2000, "ftol": 1e-12})
     if not res.success:
         raise ValueError("Falha na otimização de Máx. Sharpe.")
     return res.x
@@ -284,7 +288,8 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
         else:
             raise ValueError("mode inválido")
 
-        return minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
+        return minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons,
+                        options={"maxiter": 2000, "ftol": 1e-12})
 
     active = [int(i) for i in order if w0[i] >= MIN_PESO]
     if not active:
@@ -308,6 +313,58 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
     s = w0.sum()
     return w0 / s if s > 0 else np.ones(len(ativos)) / len(ativos)
 
+# ========= SOLVER ROBUSTO PARA 'RETORNO ALVO + MÁX. DD' =========
+def solve_return_dd(mean_returns, cov_matrix, tickers, perfil, restricoes_por_perfil,
+                    classe_ativos, returns_sel, retorno_alvo, max_dd_user,
+                    n_starts: int = 20):
+    """
+    Tenta achar pesos factíveis (soma=1, retorno alvo, limites de classe/ativo e Máx.DD).
+    Usa multi-start + checagem explícita do DD. Retorna pesos se e somente se abs(DD) <= max_dd_user + EPS.
+    """
+    n = len(tickers)
+    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)
+    mu = mean_returns.loc[list(tickers)].values
+    Sigma = cov_matrix.loc[list(tickers), list(tickers)].values
+
+    cons_base = [
+        {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
+        {'type': 'eq', 'fun': lambda x, mu=mu: np.dot(x, mu) - retorno_alvo},
+        {'type': 'ineq','fun': dd_constraint_factory(returns_sel[list(tickers)], max_dd_user)}
+    ]
+    cons = cons_base + class_constraints(tickers, perfil, restricoes_por_perfil, classe_ativos)
+
+    def obj(x):
+        return float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
+
+    # conjunto de pontos iniciais
+    x0_list = [np.ones(n)/n]  # pesos iguais
+    rng = np.random.default_rng(42)
+    for _ in range(n_starts-1):
+        v = rng.random(n)
+        v = v / v.sum()
+        x0_list.append(v)
+
+    best = None
+    best_vol = np.inf
+
+    for x0 in x0_list:
+        res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons,
+                       options={"maxiter": 2000, "ftol": 1e-12})
+        if not res.success:
+            continue
+        w = res.x
+        dd, _ = max_drawdown_of_weights(w, returns_sel[list(tickers)])
+        if abs(dd) <= (max_dd_user + EPS):
+            v = obj(w)
+            if v < best_vol:
+                best = w
+                best_vol = v
+
+    if best is None:
+        raise ValueError("❌ Nenhuma carteira factível (Retorno alvo + Máx. DD). "
+                         "Tente relaxar o DD, ajustar limites por classe, incluir Caixa ou reduzir o retorno alvo.")
+    return best
+
 # ========= CACHE para otimização principal =========
 @st.cache_data(show_spinner=False)
 def otimizar_portfolio(criterio, perfil, retorno_alvo, max_dd_user,
@@ -326,36 +383,28 @@ def otimizar_portfolio(criterio, perfil, retorno_alvo, max_dd_user,
         achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
         dd_info = None
     else:
-        n = len(df_sel_columns)
-        bounds = build_bounds(df_sel_columns, perfil, lower_is_minpeso=False)
-        Sigma = cov_matrix.values
-        mu = mean_returns.values
-        x0 = np.ones(n)/n
-        cons = [
-            {'type': 'eq', 'fun': lambda x: np.sum(x) - 1},
-            {'type': 'eq', 'fun': lambda x, mu=mu: np.dot(x, mu) - retorno_alvo},
-            {'type': 'ineq','fun': dd_constraint_factory(returns_sel, max_dd_user)}
-        ]
-        cons += class_constraints(df_sel_columns, perfil, limites_demo, classe_ativos)
-        obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
-        res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
-        if res.success:
-            pesos_otimizados = enforce_min1(
-                res.x, df_sel_columns, perfil, mean_returns, cov_matrix,
-                limites_demo, classe_ativos,
-                mode="min_vol_target_dd", target_return=retorno_alvo,
-                returns_sel=returns_sel, max_dd=max_dd_user, rf_daily=rf_daily
-            )
-            achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
+        # 1) resolver com DD hard (multi-start)
+        base = solve_return_dd(mean_returns, cov_matrix, df_sel_columns, perfil, limites_demo,
+                               classe_ativos, returns_sel, retorno_alvo, max_dd_user, n_starts=25)
 
-            # Checagem explícita do teto de DD
-            if abs(achieved_dd) <= (max_dd_user + EPS):
-                dd_info = ("ok", achieved_dd)
-            else:
-                dd_info = ("violado", achieved_dd)
-        else:
-            raise ValueError("❌ Nenhuma carteira factível encontrada para Retorno alvo + Máx. DD "
-                             "(tente relaxar o DD, ajustar limites por classe, incluir Caixa ou ampliar tolerância).")
+        # 2) aplicar regra 0% ou ≥1% preservando as restrições, incluindo DD
+        pesos_otimizados = enforce_min1(
+            base, df_sel_columns, perfil, mean_returns, cov_matrix,
+            limites_demo, classe_ativos,
+            mode="min_vol_target_dd", target_return=retorno_alvo,
+            returns_sel=returns_sel, max_dd=max_dd_user, rf_daily=rf_daily
+        )
+
+        # 3) checagem final de DD (HARD)
+        achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
+        if abs(achieved_dd) > (max_dd_user + EPS):
+            raise ValueError(
+                f"❌ Carteira obtida após ajuste de mínimos viola o Máx. DD "
+                f"({abs(achieved_dd)*100:.2f}% > {max_dd_user*100:.2f}%). "
+                f"Tente relaxar o DD, incluir mais Caixa/RF, ou reduzir o retorno alvo."
+            )
+        dd_info = ("ok", achieved_dd)
+
     return pesos_otimizados, dd_info
 
 def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, classe_ativos,
@@ -648,6 +697,7 @@ try:
                 if modo == "ok":
                     st.success(f"Máx. Drawdown da carteira exibida: {abs(dd_val)*100:.2f}% (dentro do alvo).")
                 else:
+                    # Em v16.6 nunca mostramos violado; deixo apenas por segurança futura
                     st.warning(f"⚠️ Máx. Drawdown da carteira exibida: {abs(dd_val)*100:.2f}% — ACIMA do limite solicitado.")
 
             # -------- Tabela: Otimizada x GMVP x Máx. Sharpe x Benchmark --------
@@ -676,7 +726,7 @@ try:
             if benchmark_retornos is not None and not getattr(benchmark_retornos, "empty", True):
                 _, bench_alinh = port_opt.align(benchmark_retornos, join="inner")
                 r_b, v_b, s_b, dd_b = metrics(bench_alinh)
-                linhas.append([f"Benchmark ({benchmark_nome})", f"{r_b*100:.2f}%", f"{v_b*100:.2f}%", f"{s_b:.2f}", f"{dd_b*100:.2f}%"])
+                linhas.append([f"Benchmark ({benchmark_nome})", f"{r_b*100:.2f}%", f"{v_b*100:.2f}%", f"{s_b*100:.2f}" if isinstance(s_b,float) else f"{s_b:.2f}", f"{dd_b*100:.2f}%"])
 
             st.subheader("📑 Comparação de Métricas")
             st.dataframe(pd.DataFrame(linhas, columns=["Carteira", "Retorno (a.a.)", "Vol. (a.a.)", "Sharpe", "Máx. DD"]), use_container_width=True)
