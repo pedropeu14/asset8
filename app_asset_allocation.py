@@ -429,7 +429,7 @@ st.sidebar.header("Configurações")
 with st.sidebar.form("otimizacao_form", clear_on_submit=False):
     criterio = st.radio("⚙️ Critério de alocação", ["Retorno alvo", "Retorno alvo + Máx. DD"])
     perfil = st.selectbox("Perfil do investidor:", ["Conservador", "Moderado", "Agressivo"])
-    retorno_alvo = st.slider("🎯 Retorno alvo anual (%)", 2.0, 12.0, 6.0, 0.1) / 100
+    retorno_alvo = st.slider("🎯 Retorno alvo anual (%)", 2.0, 20.0, 6.0, 0.1) / 100
     max_dd_user = None
     if criterio == "Retorno alvo + Máx. DD":
         max_dd_user = st.slider("📉 Máx. Drawdown permitido (%)", 1.0, 50.0, 20.0, 0.5) / 100
