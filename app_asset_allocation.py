@@ -9,7 +9,7 @@ from scipy.optimize import minimize
 # =================== CONFIG ===================
 st.set_page_config(page_title="Asset Allocation com Fronteira Eficiente", layout="wide")
 st.title("📁 Asset Allocation com Fronteira Eficiente")
-st.caption("Build: v16.3 — Sem Monte Carlo + Botão Calcular + Cache de dados/estatísticas")
+st.caption("Build: v16.4 — Botão Calcular dentro da aba Otimização + cache; sem Monte Carlo")
 
 # Arquivos locais
 CAMINHO_PLANILHA_ATIVOS = "ativos.xlsx"
@@ -23,13 +23,8 @@ CLASS_ORDER = ["Caixa", "Renda Fixa", "Ações", "Commodities"]
 
 # Limite por ativo específico (AT1)
 AT1_TICKER_EXATO = "AT1 LN Equity"
-AT1_CAPS = {
-    "Conservador": 0.05,
-    "Moderado":    0.10,
-    "Agressivo":   0.15,
-}
-def is_at1(ticker: str) -> bool:
-    return str(ticker).strip() == AT1_TICKER_EXATO
+AT1_CAPS = {"Conservador": 0.05, "Moderado": 0.10, "Agressivo": 0.15}
+def is_at1(ticker: str) -> bool: return str(ticker).strip() == AT1_TICKER_EXATO
 
 # Classes consideradas "Caixa"
 CASH_CLASS_ALIASES = {"Caixa", "Cash"}
@@ -70,13 +65,11 @@ def _read_risk_free_cached(path, dayfirst=True):
     rf = pd.read_excel(path)
     rf.columns = rf.columns.astype(str).str.strip()
     taxa_cols = [c for c in rf.columns if c.lower() != "date" and pd.api.types.is_numeric_dtype(rf[c])]
-    if not taxa_cols:
-        return None
+    if not taxa_cols: return None
     col = taxa_cols[0]
     rf["Date"] = pd.to_datetime(rf["Date"], dayfirst=dayfirst, errors="coerce")
     rf = rf.dropna(subset=["Date"]).set_index("Date").sort_index()
-    rf_daily = (1 + rf[col] / 100.0) ** (1/252) - 1
-    return rf_daily
+    return (1 + rf[col] / 100.0) ** (1/252) - 1
 
 # ================ FUNÇÕES BASE ================
 def calc_sharpe(returns, rf_daily=None):
@@ -85,8 +78,7 @@ def calc_sharpe(returns, rf_daily=None):
         vol_ann = returns.std() * np.sqrt(252)
         return ret_ann / vol_ann if vol_ann != 0 else float("nan")
     ret_alinh, rf_alinh = returns.align(rf_daily, join="inner")
-    if ret_alinh.empty:
-        return float("nan")
+    if ret_alinh.empty: return float("nan")
     excess = ret_alinh - rf_alinh
     mu_excess_ann = excess.mean() * 252
     vol_ann = ret_alinh.std() * np.sqrt(252)
@@ -128,7 +120,7 @@ def max_drawdown_of_weights(w, returns_df):
 def dd_constraint_factory(returns_df, dd_max):
     return lambda x: dd_max - abs(max_drawdown_of_weights(x, returns_df)[0])  # g(x) >= 0
 
-# ---- Fronteira min-vol para uma malha de retornos
+# ---- Fronteira min-vol
 def minimize_volatility_with_constraints(mean_returns, cov_matrix, target_return, tickers, perfil, restricoes_por_perfil, classe_ativos):
     n = len(tickers)
     cons = [
@@ -176,11 +168,9 @@ def max_sharpe_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por
     cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
     cons += class_constraints(tickers, perfil, restricoes_por_perfil, classe_ativos)
     x0 = np.ones(len(tickers))/len(tickers)
-
     mu = mean_returns.values
     Sigma = cov_matrix.values
     mu_excess = mu - rf_ann
-
     def neg_sharpe(x):
         vol = float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
         if vol <= 1e-12: return 1e6
@@ -193,12 +183,8 @@ def max_sharpe_weights(mean_returns, cov_matrix, tickers, perfil, restricoes_por
 # ========= Seleção ordenada por classe =========
 def class_index(classe: str) -> int:
     return CLASS_ORDER.index(classe) if classe in CLASS_ORDER else len(CLASS_ORDER) + 1
-
 def sort_columns_by_class(cols, classe_ativos):
-    return sorted(
-        list(cols),
-        key=lambda t: (class_index(classe_ativos.get(t, "Outros")), classe_ativos.get(t, "Outros"), str(t))
-    )
+    return sorted(list(cols), key=lambda t: (class_index(classe_ativos.get(t, "Outros")), classe_ativos.get(t, "Outros"), str(t)))
 
 # ========= UI helpers =========
 def indicadores_totais(portfolio_returns, rf_daily=None):
@@ -222,10 +208,8 @@ def indicadores_por_ano(portfolio_returns, rf_daily=None):
         if rf_daily is not None:
             _, rf_sub = g["ret"].align(rf_daily, join="inner")
         sharpe = calc_sharpe(g["ret"], rf_sub)
-        cum = (1 + g["ret"]).cumprod()
-        peak = cum.cummax()
-        dd = (cum - peak)/peak
-        max_dd = dd.min()
+        cum = (1 + g["ret"]).cumprod(); peak = cum.cummax()
+        dd = (cum - peak)/peak; max_dd = dd.min()
         out.append([str(ano), f"{ret*100:.2f}%", f"{vol*100:.2f}%", f"{sharpe:.2f}", f"{max_dd*100:.2f}%"])
     return pd.DataFrame(out, columns=["Ano", "Retorno", "Volatilidade", "Sharpe", "Máx. Drawdown"])
 
@@ -298,14 +282,10 @@ def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, class
 st.sidebar.header("Configurações")
 criterio = st.sidebar.radio("⚙️ Critério de alocação", ["Retorno alvo", "Retorno alvo + Máx. DD"])
 perfil = st.sidebar.selectbox("Perfil do investidor:", ["Conservador", "Moderado", "Agressivo"])
-
 retorno_alvo = st.sidebar.slider("🎯 Retorno alvo anual (%)", 2.0, 12.0, 6.0, 0.1) / 100
 max_dd_user = None
 if criterio == "Retorno alvo + Máx. DD":
     max_dd_user = st.sidebar.slider("📉 Máx. Drawdown permitido (%)", 1.0, 50.0, 20.0, 0.5) / 100
-
-# Botão para evitar reruns pesados a cada clique
-recalcular = st.sidebar.button("⚡ Calcular/Atualizar")
 
 # Limites por perfil
 limites_demo = {
@@ -313,17 +293,13 @@ limites_demo = {
     "Moderado":    {"Caixa": (0, 0.5), "Ações": (0.0, 0.5), "Commodities": (0, 0.15), "Renda Fixa": (0.0, 1.0)},
     "Agressivo":   {"Caixa": (0, 0.25), "Ações": (0.0, 1.0), "Commodities": (0, 0.3), "Renda Fixa": (0, 0.6)},
 }
-
-# Sidebar: limites por classe + teto AT1
 st.sidebar.markdown("### Limites por Classe")
-limites_perfil = limites_demo[perfil]
 for classe in CLASS_ORDER:
-    if classe in limites_perfil:
-        mn, mx = limites_perfil[classe]
+    if classe in limites_demo[perfil]:
+        mn, mx = limites_demo[perfil][classe]
         st.sidebar.write(f"*{classe}*: {mn*100:.0f}% – {mx*100:.0f}%")
-for classe in limites_perfil:
+for classe,(mn,mx) in limites_demo[perfil].items():
     if classe not in CLASS_ORDER:
-        mn, mx = limites_perfil[classe]
         st.sidebar.write(f"*{classe}*: {mn*100:.0f}% – {mx*100:.0f}%")
 st.sidebar.write(f"*{AT1_TICKER_EXATO} — teto por ativo*: até {int(AT1_CAPS[perfil]*100)}%")
 
@@ -340,13 +316,15 @@ try:
     # 3) Classes (cache)
     classe_ativos = _read_classes_cached(CAMINHO_CLASSIFICACAO)
 
+    # 4) Estatísticas (cache)
+    returns, mean_returns, cov_matrix = _compute_returns_and_stats(df)
+
     # ------------------- ABAS -------------------
     tab_sel, tab_otm, tab_manual, tab_comp = st.tabs(["Seleção", "Otimização", "Pesos manuais", "Comparar Ativos"])
 
     # --------- Seleção por classe ----------
     with tab_sel:
         st.subheader("Selecione os ativos por classe")
-
         if "ativos_selecionados" not in st.session_state:
             st.session_state["ativos_selecionados"] = list(df.columns)
 
@@ -375,12 +353,9 @@ try:
         st.session_state["ativos_selecionados"] = sorted(novos)
         st.info(f"Ativos selecionados: {len(st.session_state['ativos_selecionados'])}")
 
-    # aplica seleção
+    # aplica seleção (para todas as abas)
     ativos_ok = st.session_state.get("ativos_selecionados", list(df.columns)) or list(df.columns)
     df_sel = df[ativos_ok].copy()
-
-    # 4) Estatísticas (cache)
-    returns, mean_returns, cov_matrix = _compute_returns_and_stats(df)
     returns_sel = returns[ativos_ok].dropna(how="all")
     if df_sel.empty or returns_sel.empty:
         st.error("❌ Nenhum ativo válido foi encontrado. Verifique a seleção/planilha.")
@@ -391,12 +366,25 @@ try:
 
     # ---------- ABA OTIMIZAÇÃO ----------
     with tab_otm:
-        # Só roda se clicar no botão
-        if not recalcular:
-            st.info("Aperte **Calcular/Atualizar** para rodar as otimizações.")
-            st.stop()
+        st.subheader("Rodar otimizações")
+        c1, c2 = st.columns([1,1])
+        with c1:
+            run_clicked = st.button("⚡ Calcular/Atualizar", key="run_opt")
+        with c2:
+            clear_clicked = st.button("🧹 Limpar resultados", key="clear_opt")
 
-        # 5) Otimização principal (do portfólio exibido) — sem Monte Carlo
+        if "opt_ready" not in st.session_state:
+            st.session_state["opt_ready"] = False
+        if clear_clicked:
+            st.session_state["opt_ready"] = False
+        if run_clicked:
+            st.session_state["opt_ready"] = True
+
+        if not st.session_state["opt_ready"]:
+            st.info("Aperte **Calcular/Atualizar** para rodar as otimizações.")
+            st.stop()  # <-- bloqueia só esta aba
+
+        # 5) Otimização principal — sem Monte Carlo
         if criterio == "Retorno alvo":
             w_opt_base = minimize_volatility_with_constraints(
                 mean_returns.loc[df_sel.columns], cov_matrix.loc[df_sel.columns, df_sel.columns], retorno_alvo,
@@ -424,7 +412,6 @@ try:
                 achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel[df_sel.columns])
                 dd_info = ("ok", achieved_dd)
             else:
-                # >>> MONTE CARLO REMOVIDO <<<
                 st.error("❌ Solver não encontrou solução factível para **Retorno alvo + Máx. DD** "
                          "(tente relaxar o DD, ajustar limites por classe, incluir Caixa ou alterar o retorno alvo).")
                 st.stop()
@@ -441,7 +428,7 @@ try:
         except Exception:
             w_maxsh = None
 
-        # 8) Fronteira (sem cache, mas só roda após botão)
+        # 8) Fronteira
         frontier_rets, frontier_vols = gerar_fronteira_eficiente(
             mean_returns.loc[df_sel.columns], cov_matrix.loc[df_sel.columns, df_sel.columns],
             df_sel.columns, perfil, limites_demo, classe_ativos
@@ -465,8 +452,7 @@ try:
         if w_maxsh is not None: extras.append(("Máx. Sharpe", w_maxsh, "tab:green", "^"))
 
         subt = f"📊 Alocação Ótima - Perfil {perfil} (Retorno alvo: {retorno_alvo*100:.1f}%)"
-        if criterio == "Retorno alvo + Máx. DD":
-            subt += f" • Máx. DD: {max_dd_user*100:.1f}%"
+        if criterio == "Retorno alvo + Máx. DD": subt += f" • Máx. DD: {max_dd_user*100:.1f}%"
         render_dashboard(
             pesos=pesos_otimizados,
             titulo=subt,
@@ -489,7 +475,6 @@ try:
             if modo == "ok":
                 st.success(f"Máx. Drawdown da carteira exibida: {dd_val*100:.2f}% (dentro do alvo).")
 
-        # -------- Tabela: Otimizada x GMVP x Máx. Sharpe x Benchmark --------
         def metrics(s):
             r = (1 + s.mean())**252 - 1
             v = s.std() * np.sqrt(252)
@@ -501,22 +486,18 @@ try:
         port_opt = (returns_sel[df_sel.columns] * pesos_otimizados).sum(axis=1)
         r_o, v_o, s_o, dd_o = metrics(port_opt)
         linhas.append(["Otimizada", f"{r_o*100:.2f}%", f"{v_o*100:.2f}%", f"{s_o:.2f}", f"{dd_o*100:.2f}%"])
-
         if w_gmvp is not None:
             port_g = (returns_sel[df_sel.columns] * w_gmvp).sum(axis=1)
             r_g, v_g, s_g, dd_g = metrics(port_g)
             linhas.append(["GMVP", f"{r_g*100:.2f}%", f"{v_g*100:.2f}%", f"{s_g:.2f}", f"{dd_g*100:.2f}%"])
-
         if w_maxsh is not None:
             port_m = (returns_sel[df_sel.columns] * w_maxsh).sum(axis=1)
             r_m, v_m, s_m, dd_m = metrics(port_m)
             linhas.append(["Máx. Sharpe", f"{r_m*100:.2f}%", f"{v_m*100:.2f}%", f"{s_m:.2f}", f"{dd_m*100:.2f}%"])
-
         if benchmark_retornos is not None and not getattr(benchmark_retornos, "empty", True):
             _, bench_alinh = port_opt.align(benchmark_retornos, join="inner")
             r_b, v_b, s_b, dd_b = metrics(bench_alinh)
             linhas.append([f"Benchmark ({benchmark_nome})", f"{r_b*100:.2f}%", f"{v_b*100:.2f}%", f"{s_b:.2f}", f"{dd_b*100:.2f}%"])
-
         st.subheader("📑 Comparação de Métricas")
         st.dataframe(pd.DataFrame(linhas, columns=["Carteira", "Retorno (a.a.)", "Vol. (a.a.)", "Sharpe", "Máx. DD"]), use_container_width=True)
 
@@ -527,12 +508,8 @@ try:
                                        index=nomes_bench.index(st.session_state.get("bench_sel", nomes_bench[0])),
                                        key="bench_sel_manual")
         st.session_state["bench_sel"] = bench_escolhido
-        if bench_escolhido != "(Sem benchmark)":
-            benchmark_retornos = bench_series[bench_escolhido]
-            benchmark_nome = bench_escolhido
-        else:
-            benchmark_retornos = None
-            benchmark_nome = None
+        benchmark_retornos = bench_series.get(bench_escolhido) if bench_escolhido != "(Sem benchmark)" else None
+        benchmark_nome = None if benchmark_retornos is None else bench_escolhido
 
         st.subheader("✍️ Pesos manuais (em %)")
         cols_ord = sort_columns_by_class(df_sel.columns, classe_ativos)
@@ -541,13 +518,9 @@ try:
             df_pesos["Peso (%)"] = np.round(100 / len(cols_ord), 2)
 
         edited = st.data_editor(
-            df_pesos,
-            num_rows="fixed",
-            use_container_width=True,
-            column_config={
-                "Peso (%)": st.column_config.NumberColumn(step=0.1, min_value=0.0, max_value=100.0),
-                "Classe": st.column_config.TextColumn(disabled=True),
-            }
+            df_pesos, num_rows="fixed", use_container_width=True,
+            column_config={"Peso (%)": st.column_config.NumberColumn(step=0.1, min_value=0.0, max_value=100.0),
+                           "Classe": st.column_config.TextColumn(disabled=True)}
         )
         soma = float(edited["Peso (%)"].sum())
         st.write(f"*Soma atual:* {soma:.2f}%")
@@ -582,34 +555,9 @@ try:
                 rf_daily=rf_daily,
             )
 
-            if benchmark_retornos is not None and not getattr(benchmark_retornos, "empty", True):
-                st.subheader("📊 Comparação com Benchmark (Pesos Manuais)")
-                port_ret_manual = (returns_sel[df_sel.columns] * pesos_man).sum(axis=1)
-                port_alinh, bench_alinh = port_ret_manual.align(benchmark_retornos, join="inner")
-
-                def _metrics_cmp(s):
-                    r = (1 + s.mean())**252 - 1
-                    v = s.std() * (252**0.5)
-                    sh = calc_sharpe(s, rf_daily)
-                    cum = (1 + s).cumprod(); peak = cum.cummax(); dd = (cum - peak)/peak; mdd = dd.min()
-                    return r, v, sh, mdd
-
-                r_pm, v_pm, sh_pm, dd_pm = _metrics_cmp(port_alinh)
-                r_bm, v_bm, sh_bm, dd_bm = _metrics_cmp(bench_alinh)
-
-                comp_manual = pd.DataFrame({
-                    "": ["Carteira", "Benchmark"],
-                    "Retorno (a.a.)": [f"{r_pm*100:.2f}%", f"{r_bm*100:.2f}%"],
-                    "Vol. (a.a.)":    [f"{v_pm*100:.2f}%", f"{v_bm*100:.2f}%"],
-                    "Sharpe":         [f"{sh_pm:.2f}",     f"{sh_bm:.2f}"],
-                    "Máx DD":         [f"{dd_pm*100:.2f}%", f"{dd_bm*100:.2f}%"],
-                })
-                st.dataframe(comp_manual, use_container_width=True)
-
     # ---------- ABA COMPARAR ATIVOS ----------
     with tab_comp:
         st.subheader("Comparar Ativos")
-
         LIMITE_ATIVOS = 6
 
         if "ativos_comp" not in st.session_state:
@@ -640,8 +588,7 @@ try:
                 for ativo in sorted(grupos[classe]):
                     marcado = ativo in base_inicial
                     ck = st.checkbox(ativo, value=marcado, key=f"comp_{ativo}")
-                    if ck:
-                        escolhidos.append(ativo)
+                    if ck: escolhidos.append(ativo)
 
         escolhidos = list(dict.fromkeys(escolhidos))
         if len(escolhidos) > LIMITE_ATIVOS:
@@ -660,9 +607,7 @@ try:
             else:
                 st.markdown("**Evolução acumulada (base = 1.0)**")
                 cum = (1 + ret_comp).cumprod()
-
-                figc, axc = plt.subplots(figsize=(3.2, 1.2))
-                figc.set_dpi(180)
+                figc, axc = plt.subplots(figsize=(3.2, 1.2)); figc.set_dpi(180)
                 for c in cum.columns:
                     axc.plot(cum.index, cum[c], lw=1.0, label=c)
 
@@ -671,31 +616,20 @@ try:
                 axc.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
 
                 ymin, ymax = float(cum.min().min()), float(cum.max().max())
-                if not np.isfinite(ymin) or not np.isfinite(ymax) or ymin == ymax:
-                    ymin, ymax = 0.95, 1.05
+                if not np.isfinite(ymin) or not np.isfinite(ymax) or ymin == ymax: ymin, ymax = 0.95, 1.05
                 axc.set_yticks(np.linspace(ymin, ymax, 3))
-                axc.tick_params(axis="x", labelsize=8)
-                axc.tick_params(axis="y", labelsize=8)
-                axc.margins(x=0)
-                axc.grid(alpha=0.25, linewidth=0.5)
+                axc.tick_params(axis="x", labelsize=8); axc.tick_params(axis="y", labelsize=8)
+                axc.margins(x=0); axc.grid(alpha=0.25, linewidth=0.5)
 
-                axc.legend(
-                    loc="center left",
-                    bbox_to_anchor=(1.01, 0.5),
-                    fontsize=8,
-                    frameon=False,
-                    ncol=1,
-                    handlelength=1.6,
-                )
-                axc.set_xlabel("")
-                axc.set_ylabel("")
+                axc.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8,
+                           frameon=False, ncol=1, handlelength=1.6)
+                axc.set_xlabel(""); axc.set_ylabel("")
                 st.pyplot(figc); plt.close(figc)
 
                 linhas = []
                 for c in ativos_comp:
                     s = ret_comp[c].dropna()
-                    if s.empty:
-                        continue
+                    if s.empty: continue
                     r = (1 + s.mean())**252 - 1
                     v = s.std() * np.sqrt(252)
                     sh = calc_sharpe(s, rf_daily)
