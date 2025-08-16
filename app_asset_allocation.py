@@ -11,6 +11,9 @@ st.set_page_config(page_title="Asset Allocation com Fronteira Eficiente", layout
 st.title("📁 Asset Allocation com Fronteira Eficiente")
 st.caption("Build: v16.5 — Botão de otimização via form (Retorno, Retorno+DD, GMVP, Máx.Sharpe) • benchmark não recalcula • comparar e pesos manuais independentes • cache em sessão")
 
+# >>> Tolerância numérica para checagem de DD <<<
+EPS = 1e-6
+
 # ====== CACHE DE OTIMIZAÇÃO EM SESSION_STATE (não depende do benchmark) ======
 if "otm_cache" not in st.session_state:
     st.session_state["otm_cache"] = {}
@@ -344,7 +347,12 @@ def otimizar_portfolio(criterio, perfil, retorno_alvo, max_dd_user,
                 returns_sel=returns_sel, max_dd=max_dd_user, rf_daily=rf_daily
             )
             achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
-            dd_info = ("ok", achieved_dd)
+
+            # Checagem explícita do teto de DD
+            if abs(achieved_dd) <= (max_dd_user + EPS):
+                dd_info = ("ok", achieved_dd)
+            else:
+                dd_info = ("violado", achieved_dd)
         else:
             raise ValueError("❌ Nenhuma carteira factível encontrada para Retorno alvo + Máx. DD "
                              "(tente relaxar o DD, ajustar limites por classe, incluir Caixa ou ampliar tolerância).")
@@ -638,7 +646,9 @@ try:
             if dd_info is not None:
                 modo, dd_val = dd_info
                 if modo == "ok":
-                    st.success(f"Máx. Drawdown da carteira exibida: {dd_val*100:.2f}% (dentro do alvo).")
+                    st.success(f"Máx. Drawdown da carteira exibida: {abs(dd_val)*100:.2f}% (dentro do alvo).")
+                else:
+                    st.warning(f"⚠️ Máx. Drawdown da carteira exibida: {abs(dd_val)*100:.2f}% — ACIMA do limite solicitado.")
 
             # -------- Tabela: Otimizada x GMVP x Máx. Sharpe x Benchmark --------
             def metrics(s):
