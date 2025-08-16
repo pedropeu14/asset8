@@ -11,8 +11,9 @@ st.set_page_config(page_title="Fortune Financial Strategies - Asset Allocation",
 st.title("Fortune Financial Strategies - Asset Allocation")
 st.caption("Build: v16.6 — by Pedro Freitas de Amorim (DD hard constraint, multi-start)")
 
-# >>> Tolerância numérica para checagem de DD <<<
-EPS = 1e-6
+# >>> Tolerâncias numéricas <<<
+EPS = 1e-6                 # para DD
+RET_TOL = 1e-4             # ~0,01% a.a. para checagem de retorno alvo
 
 # ====== CACHE DE OTIMIZAÇÃO EM SESSION_STATE (não depende do benchmark) ======
 if "otm_cache" not in st.session_state:
@@ -313,6 +314,36 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
     s = w0.sum()
     return w0 / s if s > 0 else np.ones(len(ativos)) / len(ativos)
 
+# ========= Helpers de viabilidade de retorno =========
+def _solve_linear_return(mu_vec, tickers, perfil, restricoes_por_perfil, classe_ativos, maximize=True):
+    """
+    Resolve: max/min mu' x  s.a. sum(x)=1 e limites de classe/ativo (sem DD).
+    Retorna (pesos, valor).
+    """
+    n = len(tickers)
+    bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)
+    cons = [{'type': 'eq', 'fun': lambda x: np.sum(x) - 1}]
+    cons += class_constraints(tickers, perfil, restricoes_por_perfil, classe_ativos)
+    x0 = np.ones(n)/n
+
+    def obj(x):
+        val = float(np.dot(mu_vec, x))
+        return -val if maximize else val
+
+    res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons,
+                   options={"maxiter": 2000, "ftol": 1e-12})
+    if not res.success:
+        return None, None
+    x = res.x
+    return x, float(np.dot(mu_vec, x))
+
+def retorno_min_max(mean_returns, tickers, perfil, restricoes_por_perfil, classe_ativos):
+    """Retorna (ret_min, ret_max) viáveis sem DD (somente limites de classe/ativo e soma=1)."""
+    mu_vec = mean_returns.loc[list(tickers)].values
+    _, rmin = _solve_linear_return(mu_vec, tickers, perfil, restricoes_por_perfil, classe_ativos, maximize=False)
+    _, rmax = _solve_linear_return(mu_vec, tickers, perfil, restricoes_por_perfil, classe_ativos, maximize=True)
+    return rmin, rmax
+
 # ========= SOLVER ROBUSTO PARA 'RETORNO ALVO + MÁX. DD' =========
 def solve_return_dd(mean_returns, cov_matrix, tickers, perfil, restricoes_por_perfil,
                     classe_ativos, returns_sel, retorno_alvo, max_dd_user,
@@ -365,29 +396,61 @@ def solve_return_dd(mean_returns, cov_matrix, tickers, perfil, restricoes_por_pe
                          "Tente relaxar o DD, ajustar limites por classe, incluir Caixa ou reduzir o retorno alvo.")
     return best
 
-# ========= CACHE para otimização principal =========
+# ========= CACHE para otimização principal (com checagens duras) =========
 @st.cache_data(show_spinner=False)
 def otimizar_portfolio(criterio, perfil, retorno_alvo, max_dd_user,
                        df_sel_columns, mean_returns, cov_matrix,
                        limites_demo, classe_ativos, returns_sel, rf_daily):
-    if criterio == "Retorno alvo":
-        w_opt_base = minimize_volatility_with_constraints(
-            mean_returns, cov_matrix, retorno_alvo,
-            df_sel_columns, perfil, limites_demo, classe_ativos
+
+    # 0) Checagem rápida: alvo dentro do intervalo viável (sem DD)?
+    rmin, rmax = retorno_min_max(mean_returns, df_sel_columns, perfil, limites_demo, classe_ativos)
+    if rmin is None or rmax is None:
+        raise ValueError("Não foi possível avaliar a viabilidade do retorno com os limites atuais.")
+    if (retorno_alvo > rmax + RET_TOL) or (retorno_alvo < rmin - RET_TOL):
+        raise ValueError(
+            f"Sem solução factível para este Retorno Alvo. "
+            f"Faixa viável (sem DD) com os limites atuais: {rmin*100:.2f}% – {rmax*100:.2f}% a.a."
         )
+
+    if criterio == "Retorno alvo":
+        # 1) Minimiza vol com retorno-alvo
+        try:
+            w_opt_base = minimize_volatility_with_constraints(
+                mean_returns, cov_matrix, retorno_alvo,
+                df_sel_columns, perfil, limites_demo, classe_ativos
+            )
+        except Exception:
+            raise ValueError(
+                "Sem solução factível para este Retorno Alvo. "
+                "Ajuste o alvo ou a seleção/limites de ativos."
+            )
+
+        # 2) Aplica 0% ou ≥1% e revalida o retorno
         pesos_otimizados = enforce_min1(
             w_opt_base, df_sel_columns, perfil, mean_returns, cov_matrix,
             limites_demo, classe_ativos,
             mode="min_vol_target", target_return=retorno_alvo, rf_daily=rf_daily
         )
-        achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
-        dd_info = None
-    else:
-        # 1) resolver com DD hard (multi-start)
-        base = solve_return_dd(mean_returns, cov_matrix, df_sel_columns, perfil, limites_demo,
-                               classe_ativos, returns_sel, retorno_alvo, max_dd_user, n_starts=25)
 
-        # 2) aplicar regra 0% ou ≥1% preservando as restrições, incluindo DD
+        ret_hit = float(np.dot(pesos_otimizados, mean_returns.loc[list(df_sel_columns)].values))
+        if abs(ret_hit - retorno_alvo) > max(RET_TOL, 1e-6):
+            raise ValueError(
+                f"Sem solução factível para este Retorno Alvo após aplicar a regra de mínimos. "
+                f"Retorno obtido: {ret_hit*100:.2f}% a.a."
+            )
+
+        achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
+        dd_info = None  # sem DD neste modo
+        return pesos_otimizados, dd_info
+
+    else:
+        # 1) Resolver com DD hard
+        base = solve_return_dd(
+            mean_returns, cov_matrix, df_sel_columns, perfil, limites_demo,
+            classe_ativos, returns_sel, retorno_alvo, max_dd_user, n_starts=25
+        )
+
+        # 2) Aplicar 0% ou ≥1% mantendo retorno e DD
         pesos_otimizados = enforce_min1(
             base, df_sel_columns, perfil, mean_returns, cov_matrix,
             limites_demo, classe_ativos,
@@ -395,17 +458,22 @@ def otimizar_portfolio(criterio, perfil, retorno_alvo, max_dd_user,
             returns_sel=returns_sel, max_dd=max_dd_user, rf_daily=rf_daily
         )
 
-        # 3) checagem final de DD (HARD)
+        # 3) Checagens duras pós-ajuste
+        ret_hit = float(np.dot(pesos_otimizados, mean_returns.loc[list(df_sel_columns)].values))
+        if abs(ret_hit - retorno_alvo) > max(RET_TOL, 1e-6):
+            raise ValueError(
+                f"Sem solução factível (Retorno alvo + Máx. DD) após a regra de mínimos. "
+                f"Retorno obtido: {ret_hit*100:.2f}% a.a."
+            )
         achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
         if abs(achieved_dd) > (max_dd_user + EPS):
             raise ValueError(
-                f"❌ Carteira obtida após ajuste de mínimos viola o Máx. DD "
-                f"({abs(achieved_dd)*100:.2f}% > {max_dd_user*100:.2f}%). "
-                f"Tente relaxar o DD, incluir mais Caixa/RF, ou reduzir o retorno alvo."
+                f"Sem solução factível (Retorno alvo + Máx. DD) após a regra de mínimos. "
+                f"DD obtido: {abs(achieved_dd)*100:.2f}%."
             )
-        dd_info = ("ok", achieved_dd)
 
-    return pesos_otimizados, dd_info
+        dd_info = ("ok", achieved_dd)
+        return pesos_otimizados, dd_info
 
 def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, classe_ativos,
                      benchmark_retornos=None, benchmark_nome=None,
@@ -830,106 +898,6 @@ try:
                     "Máx DD":         [f"{dd_pm*100:.2f}%", f"{dd_bm*100:.2f}%"],
                 })
                 st.dataframe(comp_manual, use_container_width=True)
-
-    # 11) COMPARAR ATIVOS — independe do botão
-    with tab_comp:
-        st.subheader("Comparar Ativos")
-
-        LIMITE_ATIVOS = 6
-
-        if "ativos_comp" not in st.session_state:
-            st.session_state["ativos_comp"] = list(df_sel.columns[:min(LIMITE_ATIVOS, len(df_sel.columns))])
-
-        total_disponiveis_comp = list(df_sel.columns)
-        todos_marcados_comp = len(st.session_state["ativos_comp"]) == len(total_disponiveis_comp)
-        label_btn_comp = "Desmarcar todos" if todos_marcados_comp else "Selecionar todos"
-        if st.button(label_btn_comp, key="toggle_comp_all"):
-            if todos_marcados_comp:
-                st.session_state["ativos_comp"] = []
-            else:
-                st.session_state["ativos_comp"] = total_disponiveis_comp[:LIMITE_ATIVOS]
-                if len(total_disponiveis_comp) > LIMITE_ATIVOS:
-                    st.info(f"Selecionados os {LIMITE_ATIVOS} primeiros ativos (limite atingido).")
-
-        grupos = {}
-        for t in df_sel.columns:
-            grupos.setdefault(classe_ativos.get(t, "Outros"), []).append(t)
-        classes_ordenadas = [c for c in CLASS_ORDER if c in grupos] + [c for c in grupos if c not in CLASS_ORDER]
-
-        cols = st.columns(len(classes_ordenadas) if classes_ordenadas else 1)
-        escolhidos = []
-        base_inicial = set(st.session_state["ativos_comp"])
-        for col, classe in zip(cols, classes_ordenadas):
-            with col:
-                st.markdown(f"*{classe}*")
-                for ativo in sorted(grupos[classe]):
-                    marcado = ativo in base_inicial
-                    ck = st.checkbox(ativo, value=marcado, key=f"comp_{ativo}")
-                    if ck:
-                        escolhidos.append(ativo)
-
-        escolhidos = list(dict.fromkeys(escolhidos))
-        if len(escolhidos) > LIMITE_ATIVOS:
-            escolhidos = escolhidos[:LIMITE_ATIVOS]
-            st.warning(f"Limite de {LIMITE_ATIVOS} ativos para comparação. Apenas os primeiros foram mantidos.")
-
-        st.session_state["ativos_comp"] = escolhidos
-        ativos_comp = st.session_state["ativos_comp"]
-
-        if not ativos_comp:
-            st.warning("Selecione ao menos um ativo para comparar.")
-        else:
-            ret_comp = returns_sel[ativos_comp].dropna(how="all")
-            if ret_comp.empty:
-                st.warning("Não há dados válidos para os ativos selecionados.")
-            else:
-                st.markdown("**Evolução acumulada (base = 1.0)**")
-                cum = (1 + ret_comp).cumprod()
-
-                figc, axc = plt.subplots(figsize=(3.2, 1.2))
-                figc.set_dpi(180)
-                for c in cum.columns:
-                    axc.plot(cum.index, cum[c], lw=1.0, label=c)
-
-                locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
-                axc.xaxis.set_major_locator(locator)
-                axc.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-
-                ymin, ymax = float(cum.min().min()), float(cum.max().max())
-                if not np.isfinite(ymin) or not np.isfinite(ymax) or ymin == ymax:
-                    ymin, ymax = 0.95, 1.05
-                axc.set_yticks(np.linspace(ymin, ymax, 3))
-                axc.tick_params(axis="x", labelsize=8)
-                axc.tick_params(axis="y", labelsize=8)
-                axc.margins(x=0)
-                axc.grid(alpha=0.25, linewidth=0.5)
-
-                axc.legend(
-                    loc="center left",
-                    bbox_to_anchor=(1.01, 0.5),
-                    fontsize=8,
-                    frameon=False,
-                    ncol=1,
-                    handlelength=1.6,
-                )
-                axc.set_xlabel("")
-                axc.set_ylabel("")
-                st.pyplot(figc)
-
-                linhas = []
-                for c in ativos_comp:
-                    s = ret_comp[c].dropna()
-                    if s.empty:
-                        continue
-                    r = (1 + s.mean())**252 - 1
-                    v = s.std() * np.sqrt(252)
-                    sh = calc_sharpe(s, rf_daily)
-                    cum_s = (1 + s).cumprod(); pk = cum_s.cummax()
-                    dd = (cum_s - pk) / pk; mdd = dd.min()
-                    linhas.append([c, classe_ativos.get(c, "Outros"),
-                                   f"{r*100:.2f}%", f"{v*100:.2f}%", f"{sh:.2f}", f"{mdd*100:.2f}%"])
-                df_comp = pd.DataFrame(linhas, columns=["Ativo", "Classe", "Retorno (a.a.)", "Vol. (a.a.)", "Sharpe", "Máx. DD"])
-                st.dataframe(df_comp, use_container_width=True)
 
 except Exception as e:
     st.error(f"❌ Erro ao processar: {e}")
