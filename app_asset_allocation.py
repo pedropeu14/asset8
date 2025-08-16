@@ -7,8 +7,8 @@ import matplotlib.dates as mdates
 from scipy.optimize import minimize
 
 # =================== CONFIG ===================
-st.set_page_config(page_title="Fortune Financial Strategies", layout="wide")
-st.title("📁 Asset Allocation com Fronteira Eficiente")
+st.set_page_config(page_title="Fortune Financial Strategies - Asset Allocation", layout="wide")
+st.title("Fortune Financial Strategies - Asset Allocation")
 st.caption("Build: v16.5 — by Pedro Freitas de Amorim")
 
 # >>> Tolerância numérica para checagem de DD <<<
