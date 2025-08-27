@@ -274,7 +274,7 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
         x0 = np.ones(len(t_sub)) / len(t_sub)
 
         if mode in ("min_vol_target", "min_vol_target_dd", "gmvp"):
-            obj = lambda x: float(np.sqrt(np.dot(Sig @ x, x)))
+            obj = lambda x: float(np.sqrt(np.dot(Sig @ x, x))))
         elif mode == "max_sharpe":
             mu_exc = mu - rf_ann
             def obj(x):
@@ -348,13 +348,17 @@ def otimizar_portfolio(criterio, perfil, retorno_alvo, max_dd_user,
             )
             achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
 
-            # Checagem explícita do teto de DD
+            # Checagem explícita do teto de DD -> AGORA BLOQUEIA
             if abs(achieved_dd) <= (max_dd_user + EPS):
                 dd_info = ("ok", achieved_dd)
             else:
-                dd_info = ("violado", achieved_dd)
+                # <<< MUDANÇA: dispara erro para o chamador NÃO mostrar carteira >>>
+                raise ValueError(
+                    f"Sem solução factível para **Retorno alvo + Máx. DD** com os parâmetros atuais. "
+                    f"(DD obtido {abs(achieved_dd)*100:.2f}% > limite {max_dd_user*100:.2f}%)"
+                )
         else:
-            raise ValueError("❌ Nenhuma carteira factível encontrada para Retorno alvo + Máx. DD "
+            raise ValueError("❌ Nenhuma carteira factível encontrada para **Retorno alvo + Máx. DD** "
                              "(tente relaxar o DD, ajustar limites por classe, incluir Caixa ou ampliar tolerância).")
     return pesos_otimizados, dd_info
 
