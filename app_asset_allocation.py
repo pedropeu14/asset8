@@ -274,7 +274,7 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
         x0 = np.ones(len(t_sub)) / len(t_sub)
 
         if mode in ("min_vol_target", "min_vol_target_dd", "gmvp"):
-            obj = lambda x: float(np.sqrt(np.dot(Sig @ x, x))))
+            obj = lambda x: float(np.sqrt(np.dot(Sig @ x, x)))
         elif mode == "max_sharpe":
             mu_exc = mu - rf_ann
             def obj(x):
