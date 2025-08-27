@@ -501,7 +501,7 @@ try:
         for t in df.columns:
             grupos.setdefault(classe_ativos.get(t, "Outros"), []).append(t)
 
-        classes_ordenadas = [c for c in CLASS_ORDER if c in grupos] + [c for c in grupos if c não in CLASS_ORDER]
+        classes_ordenadas = [c for c in CLASS_ORDER if c in grupos] + [c for c in grupos if c not in CLASS_ORDER]
         colunas = st.columns(len(classes_ordenadas) if classes_ordenadas else 1)
 
         novos = set(st.session_state["ativos_selecionados"])
