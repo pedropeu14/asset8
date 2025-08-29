@@ -19,8 +19,6 @@ if "otm_cache" not in st.session_state:
     st.session_state["otm_cache"] = {}
 if "last_otm_key" not in st.session_state:
     st.session_state["last_otm_key"] = None  # guarda a última key otimizada com sucesso
-if "otm_error" not in st.session_state:
-    st.session_state["otm_error"] = None     # guarda a última mensagem de erro (inviável)
 
 def make_cache_key(ativos_ok, perfil, criterio, retorno_alvo, max_dd_user):
     return (
@@ -276,7 +274,6 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
         x0 = np.ones(len(t_sub)) / len(t_sub)
 
         if mode in ("min_vol_target", "min_vol_target_dd", "gmvp"):
-            # >>> sem parêntese extra aqui <<<
             obj = lambda x: float(np.sqrt(np.dot(Sig @ x, x)))
         elif mode == "max_sharpe":
             mu_exc = mu - rf_ann
@@ -321,7 +318,6 @@ def otimizar_portfolio(criterio, perfil, retorno_alvo, max_dd_user,
             mean_returns, cov_matrix, retorno_alvo,
             df_sel_columns, perfil, limites_demo, classe_ativos
         )
-        # Se o solver falhar, a função acima levanta ValueError.
         pesos_otimizados = enforce_min1(
             w_opt_base, df_sel_columns, perfil, mean_returns, cov_matrix,
             limites_demo, classe_ativos,
@@ -352,16 +348,13 @@ def otimizar_portfolio(criterio, perfil, retorno_alvo, max_dd_user,
             )
             achieved_dd, _ = max_drawdown_of_weights(pesos_otimizados, returns_sel)
 
-            # Checagem explícita do teto de DD -> BLOQUEIA exibição se violado
+            # Checagem explícita do teto de DD
             if abs(achieved_dd) <= (max_dd_user + EPS):
                 dd_info = ("ok", achieved_dd)
             else:
-                raise ValueError(
-                    f"Sem solução factível para **Retorno alvo + Máx. DD** com os parâmetros atuais. "
-                    f"(DD obtido {abs(achieved_dd)*100:.2f}% > limite {max_dd_user*100:.2f}%)"
-                )
+                dd_info = ("violado", achieved_dd)
         else:
-            raise ValueError("❌ Nenhuma carteira factível encontrada para **Retorno alvo + Máx. DD** "
+            raise ValueError("❌ Nenhuma carteira factível encontrada para Retorno alvo + Máx. DD "
                              "(tente relaxar o DD, ajustar limites por classe, incluir Caixa ou ampliar tolerância).")
     return pesos_otimizados, dd_info
 
@@ -444,8 +437,8 @@ with st.sidebar.form("otimizacao_form", clear_on_submit=False):
     # Limites por perfil
     limites_demo = {
         "Conservador": {"Caixa": (0, 1.0), "Ações": (0, 0.2), "Commodities": (0, 0.05), "Renda Fixa": (0.0, 1.0)},
-        "Moderado":    {"Caixa": (0, 0.5), "Ações": (0, 0.5), "Commodities": (0, 0.15), "Renda Fixa": (0.0, 1.0)},
-        "Agressivo":   {"Caixa": (0, 0.25), "Ações": (0, 1.0), "Commodities": (0, 0.3), "Renda Fixa": (0, 0.6)},
+        "Moderado":    {"Caixa": (0, 0.5), "Ações": (0.0, 0.5), "Commodities": (0, 0.15), "Renda Fixa": (0.0, 1.0)},
+        "Agressivo":   {"Caixa": (0, 0.25), "Ações": (0.0, 1.0), "Commodities": (0, 0.3), "Renda Fixa": (0, 0.6)},
     }
 
     st.markdown("### Limites por Classe")
@@ -533,7 +526,6 @@ try:
     if do_calc:
         # Executa otimização e salva no cache da sessão
         try:
-            st.session_state["otm_error"] = None
             pesos_otimizados, dd_info = otimizar_portfolio(
                 criterio, perfil, retorno_alvo, max_dd_user,
                 tuple(df_sel.columns), mean_returns, cov_matrix,
@@ -574,9 +566,6 @@ try:
             st.session_state["last_otm_key"] = cache_key
             st.success("✅ Otimização concluída.")
         except Exception as e:
-            # Marca erro e limpa a chave corrente para não mostrar resultado antigo
-            st.session_state["otm_error"] = str(e)
-            st.session_state["last_otm_key"] = None
             st.error(str(e))
 
     # 7) Benchmark (com cache leve de arquivo) — indep. do botão
@@ -596,7 +585,7 @@ try:
         except Exception:
             pass
 
-    # 9) OTIMIZAÇÃO (gráficos + comparações) — só mostra se houver resultado em cache ATUAL
+    # 9) OTIMIZAÇÃO (gráficos + comparações) — só mostra se houver resultado em cache
     with tab_otm:
         nomes_bench = ["(Sem benchmark)"] + list(bench_series.keys())
         if "bench_sel" not in st.session_state:
@@ -614,14 +603,10 @@ try:
             benchmark_retornos = None
             benchmark_nome = None
 
+        # Decide qual key usar para exibição: a última otimizada com sucesso
         show_key = st.session_state.get("last_otm_key", None)
-        erro_msg = st.session_state.get("otm_error", None)
 
-        if erro_msg:
-            # Inviável: mostra somente a mensagem
-            st.warning("Não foi possível encontrar carteira com os parâmetros atuais de retorno e/ou Máx. DD.")
-            st.info(erro_msg)
-        elif show_key is None or show_key not in st.session_state["otm_cache"]:
+        if show_key is None or show_key not in st.session_state["otm_cache"]:
             st.info("⚙️ Configure os parâmetros no sidebar e clique em **Calcular otimização** para ver os resultados.")
         else:
             hit = st.session_state["otm_cache"][show_key]
@@ -636,6 +621,7 @@ try:
             if w_gmvp is not None: extras.append(("GMVP", w_gmvp, "tab:blue", "D"))
             if w_maxsh is not None: extras.append(("Máx. Sharpe", w_maxsh, "tab:green", "^"))
 
+            # Para o subtítulo, use os parâmetros do form atuais — só informativo
             subt = f"📊 Alocação Ótima — Perfil {perfil} (Retorno alvo: {retorno_alvo*100:.1f}%)"
             if criterio == "Retorno alvo + Máx. DD" and ('max_dd_user' in locals()) and max_dd_user is not None:
                 subt += f" • Máx. DD: {max_dd_user*100:.1f}%"
@@ -661,6 +647,54 @@ try:
                 modo, dd_val = dd_info
                 if modo == "ok":
                     st.success(f"Máx. Drawdown da carteira exibida: {abs(dd_val)*100:.2f}% (dentro do alvo).")
+                else:
+                    st.warning(f"⚠️ Máx. Drawdown da carteira exibida: {abs(dd_val)*100:.2f}% — ACIMA do limite solicitado.")
+
+            # -------- Tabela: Otimizada x GMVP x Máx. Sharpe x Benchmark --------
+            def metrics(s):
+                r = (1 + s.mean())**252 - 1
+                v = s.std() * np.sqrt(252)
+                sh = calc_sharpe(s, rf_daily)
+                cum = (1 + s).cumprod(); peak = cum.cummax(); dd = (cum - peak)/peak; mdd = dd.min()
+                return r, v, sh, mdd
+
+            linhas = []
+            port_opt = (returns_sel * pesos_otimizados).sum(axis=1)
+            r_o, v_o, s_o, dd_o = metrics(port_opt)
+            linhas.append(["Otimizada", f"{r_o*100:.2f}%", f"{v_o*100:.2f}%", f"{s_o:.2f}", f"{dd_o*100:.2f}%"])
+
+            if w_gmvp is not None:
+                port_g = (returns_sel * w_gmvp).sum(axis=1)
+                r_g, v_g, s_g, dd_g = metrics(port_g)
+                linhas.append(["GMVP", f"{r_g*100:.2f}%", f"{v_g*100:.2f}%", f"{s_g:.2f}", f"{dd_g*100:.2f}%"])
+
+            if w_maxsh is not None:
+                port_m = (returns_sel * w_maxsh).sum(axis=1)
+                r_m, v_m, s_m, dd_m = metrics(port_m)
+                linhas.append(["Máx. Sharpe", f"{r_m*100:.2f}%", f"{v_m*100:.2f}%", f"{s_m:.2f}", f"{dd_m*100:.2f}%"])
+
+            if benchmark_retornos is not None and not getattr(benchmark_retornos, "empty", True):
+                _, bench_alinh = port_opt.align(benchmark_retornos, join="inner")
+                r_b, v_b, s_b, dd_b = metrics(bench_alinh)
+                linhas.append([f"Benchmark ({benchmark_nome})", f"{r_b*100:.2f}%", f"{v_b*100:.2f}%", f"{s_b:.2f}", f"{dd_b*100:.2f}%"])
+
+            st.subheader("📑 Comparação de Métricas")
+            st.dataframe(pd.DataFrame(linhas, columns=["Carteira", "Retorno (a.a.)", "Vol. (a.a.)", "Sharpe", "Máx. DD"]), use_container_width=True)
+
+            if w_maxsh is not None:
+                st.subheader("🟢 Pesos — Carteira de Máximo Sharpe")
+                cols_ord = sort_columns_by_class(df_sel.columns, classe_ativos)
+                w_series = pd.Series(w_maxsh, index=df_sel.columns).reindex(cols_ord).fillna(0.0)
+                df_pesos_ms = pd.DataFrame({
+                    "Ativo": w_series.index,
+                    "Classe": [classe_ativos.get(t, "Outros") for t in w_series.index],
+                    "Peso (%)": (w_series.values * 100).round(2)
+                })
+                st.dataframe(df_pesos_ms[df_pesos_ms["Peso (%)"] > 0], use_container_width=True)
+
+                st.subheader("📆 Indicadores por Ano — Máximo Sharpe")
+                port_m = (returns_sel * w_maxsh).sum(axis=1)
+                st.dataframe(indicadores_por_ano(port_m, rf_daily), use_container_width=True)
 
     # 10) PESOS MANUAIS — independe do botão
     with tab_manual:
@@ -724,11 +758,36 @@ try:
                 rf_daily=rf_daily,
             )
 
+            if benchmark_retornos is not None and not getattr(benchmark_retornos, "empty", True):
+                st.subheader("📊 Comparação com Benchmark (Pesos Manuais)")
+                port_ret_manual = (returns_sel * pesos_man).sum(axis=1)
+                port_alinh, bench_alinh = port_ret_manual.align(benchmark_retornos, join="inner")
+
+                def _metrics_cmp(s):
+                    r = (1 + s.mean())**252 - 1
+                    v = s.std() * (252**0.5)
+                    sh = calc_sharpe(s, rf_daily)
+                    cum = (1 + s).cumprod(); peak = cum.cummax(); dd = (cum - peak)/peak; mdd = dd.min()
+                    return r, v, sh, mdd
+
+                r_pm, v_pm, sh_pm, dd_pm = _metrics_cmp(port_alinh)
+                r_bm, v_bm, sh_bm, dd_bm = _metrics_cmp(bench_alinh)
+
+                comp_manual = pd.DataFrame({
+                    "": ["Carteira", "Benchmark"],
+                    "Retorno (a.a.)": [f"{r_pm*100:.2f}%", f"{r_bm*100:.2f}%"],
+                    "Vol. (a.a.)":    [f"{v_pm*100:.2f}%", f"{v_bm*100:.2f}%"],
+                    "Sharpe":         [f"{sh_pm:.2f}",     f"{sh_bm:.2f}"],
+                    "Máx DD":         [f"{dd_pm*100:.2f}%", f"{dd_bm*100:.2f}%"],
+                })
+                st.dataframe(comp_manual, use_container_width=True)
+
     # 11) COMPARAR ATIVOS — independe do botão
     with tab_comp:
         st.subheader("Comparar Ativos")
 
         LIMITE_ATIVOS = 6
+
         if "ativos_comp" not in st.session_state:
             st.session_state["ativos_comp"] = list(df_sel.columns[:min(LIMITE_ATIVOS, len(df_sel.columns))])
 
