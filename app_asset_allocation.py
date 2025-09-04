@@ -1,16 +1,16 @@
 import os
-import io
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from matplotlib.ticker import PercentFormatter
 from scipy.optimize import minimize
 
 # =================== CONFIG ===================
 st.set_page_config(page_title="Fortune Financial Strategies - Asset Allocation", layout="wide")
 st.title("Fortune Financial Strategies - Asset Allocation")
-st.caption("Build: v18.3 — nomes + catálogo (NomeCurto) + Correlação Macro + Regimes/Baldes + fixes")
+st.caption("Build: v18.7 — % em todos os gráficos + labels de baldes em % + nomes + catálogo + Correlação Macro + Regimes/Baldes + Pesos Manuais Y/Y")
 
 # >>> Tolerância numérica para checagem de DD <<<
 EPS = 1e-6
@@ -19,11 +19,11 @@ EPS = 1e-6
 if "otm_cache" not in st.session_state:
     st.session_state["otm_cache"] = {}
 if "last_otm_key" not in st.session_state:
-    st.session_state["last_otm_key"] = None  # guarda a última key otimizada com sucesso
+    st.session_state["last_otm_key"] = None
 
 def make_cache_key(ativos_ok, perfil, criterio, retorno_alvo, max_dd_user):
     return (
-        "v18.3-session",
+        "v18.7-session",
         tuple(ativos_ok),
         perfil,
         criterio,
@@ -35,11 +35,11 @@ def make_cache_key(ativos_ok, perfil, criterio, retorno_alvo, max_dd_user):
 CAMINHO_PLANILHA_ATIVOS = "ativos.xlsx"
 CAMINHO_CLASSIFICACAO  = "classificacao_ativos.xlsx"
 CAMINHO_BENCHMARK      = "benchmark.xlsx"
-CAMINHO_RF             = "taxa livre de risco.xlsx"  # % a.a. (coluna numérica), 1ª coluna = Date
-CAMINHO_MACRO          = "macro.xlsx"                # Date + colunas de macros (ver loader abaixo)
+CAMINHO_RF             = "taxa livre de risco.xlsx"
+CAMINHO_MACRO          = "macro.xlsx"
 
 # Regras
-MIN_PESO = 0.01  # 1% (regra 0% OU ≥1%)
+MIN_PESO = 0.01
 CLASS_ORDER = ["Caixa", "Renda Fixa", "Ações", "Commodities"]
 
 # Limite por ativo específico (AT1)
@@ -74,7 +74,7 @@ def load_risk_free(source, dayfirst=True):
     if not taxa_cols:
         return None
     col = taxa_cols[0]
-    rf["Date"] = pd.to_datetime(rf["Date"], dayfirst=True, errors="coerce")
+    rf["Date"] = pd.to_datetime(rf["Date"], dayfirst=dayfirst, errors="coerce")
     rf = rf.dropna(subset=["Date"]).set_index("Date").sort_index()
     rf_daily = (1 + rf[col] / 100.0) ** (1/252) - 1
     return rf_daily
@@ -89,13 +89,12 @@ def compute_stats(returns_sel: pd.DataFrame):
 @st.cache_data(show_spinner=False)
 def load_macro_flex(path_macro: str):
     """
-    Lê macro.xlsx e tenta mapear colunas (case-insensitive, 'contém'):
-      - Fed Funds: 'fedl01', 'fed funds', 'fedfund', 'effective fed funds', 'effr', 'us000fed'
-      - CPI YoY:   contém 'cpi' e 'yoy' (aceita 'xyoy'), detecta 'core' quando existir
+    Lê macro.xlsx e mapeia colunas por substring (case-insensitive):
+      - Fed Funds: 'fedl01','fed funds','fedfund','effective fed funds','effr','us000fed'
+      - CPI YoY:   contém 'cpi' e 'yoy' (aceita 'xyoy'), detecta 'core'
       - PCE YoY:   contém 'pce' e 'yoy' (detecta 'core')
       - DXY:       'dxy'
-    Varre todas as abas e limpa strings com '%' e ','.
-    Retorna DataFrame indexado por Date com colunas: 'fedfunds', 'cpi_yoy', 'cpi_core_yoy', 'pce_yoy', 'pce_core_yoy', 'dxy'
+    Retorna colunas padronizadas: 'fedfunds','cpi_yoy','cpi_core_yoy','pce_yoy','pce_core_yoy','dxy'
     """
     if not os.path.exists(path_macro):
         return None
@@ -161,7 +160,6 @@ def load_macro_flex(path_macro: str):
         return None
 
     out = out.sort_index()
-    # drop colunas vazias
     for c in list(out.columns):
         if out[c].dropna().empty:
             out.drop(columns=[c], inplace=True)
@@ -169,22 +167,16 @@ def load_macro_flex(path_macro: str):
 
 # ================ FUNÇÕES BASE (métricas/otimização) ================
 def calc_sharpe(returns, rf_daily=None):
-    """
-    Sharpe:
-      - sem RF: Sharpe = (E[R]_ann)/(σ[R]_ann)
-      - com RF: Sharpe = (E[R-Rf]_ann)/(σ[R-Rf]_ann)
-    """
     if rf_daily is None or (hasattr(rf_daily, "empty") and getattr(rf_daily, "empty", False)):
         ret_ann = (1 + returns.mean())**252 - 1
         vol_ann = returns.std() * np.sqrt(252)
         return ret_ann / vol_ann if vol_ann != 0 else float("nan")
-    # alinha datas
     ret_alinh, rf_alinh = returns.align(rf_daily, join="inner")
     if ret_alinh.empty:
         return float("nan")
     excess = ret_alinh - rf_alinh
     mu_excess_ann = excess.mean() * 252
-    vol_ann = excess.std() * np.sqrt(252)   # vol do excesso
+    vol_ann = excess.std() * np.sqrt(252)
     return mu_excess_ann / vol_ann if vol_ann != 0 else float("nan")
 
 def portfolio_performance(weights, mean_returns, cov_matrix):
@@ -220,7 +212,7 @@ def max_drawdown_of_weights(w, returns_df):
     return float(dd.min()), pr
 
 def dd_constraint_factory(returns_df, dd_max):
-    return lambda x: dd_max - abs(max_drawdown_of_weights(x, returns_df)[0])  # g(x) >= 0
+    return lambda x: dd_max - abs(max_drawdown_of_weights(x, returns_df)[0])
 
 def minimize_volatility_with_constraints(mean_returns, cov_matrix, target_return, tickers, perfil, restricoes_por_perfil, classe_ativos):
     n = len(tickers)
@@ -232,7 +224,7 @@ def minimize_volatility_with_constraints(mean_returns, cov_matrix, target_return
     bounds = build_bounds(tickers, perfil, lower_is_minpeso=False)
     x0 = np.ones(n) / n
     Sigma = cov_matrix.values
-    obj = lambda x: float(np.sqrt(np.dot(x.T, np.dot(Sigma, x))))
+    obj = lambda x: float(np.sqrt(((Sigma @ x).dot(x))))
     res = minimize(obj, x0, method="SLSQP", bounds=bounds, constraints=cons)
     if not res.success:
         raise ValueError("Otimização falhou para o retorno alvo informado.")
@@ -287,13 +279,10 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
                  restricoes_por_perfil, classe_ativos,
                  mode="min_vol_target", target_return=None,
                  returns_sel=None, max_dd=None, rf_daily=None):
-    """
-    Reotimiza no subset de ativos com peso >= MIN_PESO impondo lb=MIN_PESO,
-    mantendo restrições (soma=1, classe, retorno alvo e/ou DD).
-    """
     w0 = np.array(weights, float)
     order = np.argsort(-w0)
     ativos = list(tickers)
+
     rf_ann = 0.0 if (rf_daily is None or getattr(rf_daily, "empty", False)) else float((1 + rf_daily.mean())**252 - 1)
 
     def _solve_subset(idxs):
@@ -316,7 +305,7 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
         if mode in ("min_vol_target", "min_vol_target_dd", "gmvp"):
             obj = lambda x: float(np.sqrt(((Sig @ x).dot(x))))
         elif mode == "max_sharpe":
-            mu_exc = mu - (0.0 if rf_daily is None else float((1 + rf_daily.mean())**252 - 1))
+            mu_exc = mu - rf_ann
             def obj(x):
                 vol = float(np.sqrt(np.dot(x.T, np.dot(Sig, x))))
                 if vol <= 1e-12: return 1e6
@@ -338,15 +327,66 @@ def enforce_min1(weights, tickers, perfil, mean_returns, cov_matrix,
             for j, i in enumerate(idxs):
                 w_full[i] = res.x[j]
             return w_full
-        if k < len(order):
-            nxt = int(order[k])
-            if nxt not in active:
-                active.append(nxt)
 
-    # fallback
     w0[w0 < MIN_PESO] = 0.0
     s = w0.sum()
     return w0 / s if s > 0 else np.ones(len(ativos)) / len(ativos)
+
+# ========= UI HELPERS =========
+def percent_axis(ax, axis='y', mode='unit'):
+    """
+    mode:
+      - 'unit'  -> dados em fração (0.05 = 5%)        => PercentFormatter(1.0)
+      - 'pp'    -> dados em pontos percentuais (5=5%) => PercentFormatter(100.0)
+    """
+    fmt = PercentFormatter(1.0 if mode == 'unit' else 100.0)
+    if axis == 'y':
+        ax.yaxis.set_major_formatter(fmt)
+    else:
+        ax.xaxis.set_major_formatter(fmt)
+
+# [%] helpers: rótulos com % para baldes
+def _fmt_pct_value(v):
+    """Formata número em % com casas dinâmicas (para 100+, 10+, <10)."""
+    if abs(v) >= 100:
+        return f"{v:.0f}%"
+    elif abs(v) >= 10:
+        return f"{v:.1f}%"
+    else:
+        return f"{v:.2f}%"
+
+def make_bucket_label(a, b, kind):
+    """
+    kind='pct' -> a,b em fração (ex: 0.01=1%); kind='pp' -> a,b já em %.
+    Retorna 'X%–Y%'.
+    """
+    if kind == 'pct':
+        a *= 100.0; b *= 100.0
+    return f"{_fmt_pct_value(a)}–{_fmt_pct_value(b)}"
+
+def indicadores_totais(portfolio_returns, rf_daily=None):
+    ann_return = (1 + portfolio_returns.mean())**252 - 1
+    ann_vol    = portfolio_returns.std() * np.sqrt(252)
+    sharpe     = calc_sharpe(portfolio_returns, rf_daily)
+    cum = (1 + portfolio_returns).cumprod(); peak = cum.cummax()
+    dd = (cum - peak) / peak
+    max_drawdown = dd.min()
+    return ann_return, ann_vol, sharpe, max_drawdown
+
+def indicadores_por_ano(portfolio_returns, rf_daily=None):
+    df_ = portfolio_returns.to_frame("ret"); df_["ano"] = df_.index.year
+    out = []
+    for ano, g in df_.groupby("ano"):
+        ret = (1 + g["ret"]).prod() - 1
+        vol = g["ret"].std() * np.sqrt(252)
+        rf_sub = None
+        if rf_daily is not None:
+            _, rf_sub = g["ret"].align(rf_daily, join="inner")
+        sharpe = calc_sharpe(g["ret"], rf_sub)
+        cum = (1 + g["ret"]).cumprod(); peak = cum.cummax()
+        dd = (cum - peak)/peak; max_dd = dd.min()
+        out.append([str(ano), f"{ret*100:.2f}%", f"{vol*100:.2f}%", f"{sharpe:.2f}", f"{max_dd*100:.2f}%"])
+    return pd.DataFrame(out, columns=["Ano", "Retorno", "Volatilidade", "Sharpe", "Máx. Drawdown"])
 
 # ========= OTIMIZAÇÃO PRINCIPAL =========
 @st.cache_data(show_spinner=False)
@@ -402,8 +442,8 @@ def sort_columns_by_class(cols, classe_ativos):
                                              classe_ativos.get(t, "Outros"), str(t)))
 
 # ========= UTIL: nomes amigáveis =========
-DISPLAY_COL = "Nome"       # opcional (fallback)
-SHORT_COL   = "NomeCurto"  # recomendado
+DISPLAY_COL = "Nome"
+SHORT_COL   = "NomeCurto"
 def dedup_labels(labels, keys):
     seen, out = {}, []
     for lab, key in zip(labels, keys):
@@ -411,31 +451,6 @@ def dedup_labels(labels, keys):
         out.append(base if base not in seen else f"{base} [{key}]")
         seen[base] = 1
     return out
-
-# ========= UI HELPERS =========
-def indicadores_totais(portfolio_returns, rf_daily=None):
-    ann_return = (1 + portfolio_returns.mean())**252 - 1
-    ann_vol    = portfolio_returns.std() * np.sqrt(252)
-    sharpe     = calc_sharpe(portfolio_returns, rf_daily)
-    cum = (1 + portfolio_returns).cumprod(); peak = cum.cummax()
-    dd = (cum - peak) / peak
-    max_drawdown = dd.min()
-    return ann_return, ann_vol, sharpe, max_drawdown
-
-def indicadores_por_ano(portfolio_returns, rf_daily=None):
-    df_ = portfolio_returns.to_frame("ret"); df_["ano"] = df_.index.year
-    out = []
-    for ano, g in df_.groupby("ano"):
-        ret = (1 + g["ret"]).prod() - 1
-        vol = g["ret"].std() * np.sqrt(252)
-        _, rf_sub = (None, None)
-        if rf_daily is not None:
-            _, rf_sub = g["ret"].align(rf_daily, join="inner")
-        sharpe = calc_sharpe(g["ret"], rf_sub)
-        cum = (1 + g["ret"]).cumprod(); peak = cum.cummax()
-        dd = (cum - peak)/peak; max_dd = dd.min()
-        out.append([str(ano), f"{ret*100:.2f}%", f"{vol*100:.2f}%", f"{sharpe:.2f}", f"{max_dd*100:.2f}%"])
-    return pd.DataFrame(out, columns=["Ano", "Retorno", "Volatilidade", "Sharpe", "Máx. Drawdown"])
 
 def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, classe_ativos,
                      benchmark_retornos=None, benchmark_nome=None,
@@ -467,11 +482,14 @@ def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, class
 
     with c2:
         fig2, ax2 = plt.subplots(figsize=(5, 3.2))
-        (1 + portfolio_returns).cumprod().plot(ax=ax2, label="Carteira", lw=2)
+        port_cum = (1 + portfolio_returns).cumprod() - 1
+        port_cum.plot(ax=ax2, label="Carteira", lw=2)
         if benchmark_retornos is not None and not getattr(benchmark_retornos, "empty", True):
             port_alinh, bench_alinh = portfolio_returns.align(benchmark_retornos, join="inner")
-            (1 + bench_alinh).cumprod().plot(ax=ax2, ls="--", lw=1.5, label=(benchmark_nome or "Benchmark"))
-        ax2.set_title("Evolução do Portfólio"); ax2.legend()
+            ((1 + bench_alinh).cumprod() - 1).plot(ax=ax2, ls="--", lw=1.5, label=(benchmark_nome or "Benchmark"))
+        percent_axis(ax2, 'y', 'unit')
+        ax2.set_title("Evolução do Portfólio (acumulado, %)")
+        ax2.legend(); ax2.grid(alpha=0.25, linewidth=0.6)
         st.pyplot(fig2)
 
     with c3:
@@ -484,8 +502,10 @@ def render_dashboard(pesos, titulo, returns, mean_returns, cov_matrix, df, class
                 for name, w, color, marker in extra_points:
                     r, v = portfolio_performance(w, mean_returns.values, cov_matrix.values)
                     ax3.scatter(v, r, label=name)
-            ax3.set_xlabel("Volatilidade"); ax3.set_ylabel("Retorno"); ax3.legend()
-            ax3.set_title("Fronteira Eficiente")
+            percent_axis(ax3, 'x', 'unit')
+            percent_axis(ax3, 'y', 'unit')
+            ax3.set_xlabel("Volatilidade (%)"); ax3.set_ylabel("Retorno (%)"); ax3.legend()
+            ax3.set_title("Fronteira Eficiente"); ax3.grid(alpha=0.25, linewidth=0.6)
         else:
             ax3.axis("off")
         st.pyplot(fig3)
@@ -544,23 +564,19 @@ try:
         if col_need not in df_classes_raw.columns:
             raise ValueError(f"A planilha de classificação precisa das colunas '{col_need}'.")
     classe_ativos = dict(zip(df_classes_raw["Ativo"], df_classes_raw["Classe"]))
-    if DISPLAY_COL not in df_classes_raw.columns: df_classes_raw[DISPLAY_COL] = None
-    if SHORT_COL   not in df_classes_raw.columns: df_classes_raw[SHORT_COL]   = None
+    if "Nome" not in df_classes_raw.columns: df_classes_raw["Nome"] = None
+    if "NomeCurto" not in df_classes_raw.columns: df_classes_raw["NomeCurto"] = None
+    DISPLAY_COL, SHORT_COL = "Nome", "NomeCurto"
     name_map_long  = df_classes_raw.set_index("Ativo")[DISPLAY_COL].to_dict()
     name_map_short = df_classes_raw.set_index("Ativo")[SHORT_COL].to_dict()
 
     def get_name(ticker: str, prefer_short: bool = True) -> str:
         t = str(ticker).strip()
-        if prefer_short:
-            nm = (name_map_short.get(t) or "").strip()
-            if nm: return nm
-            nm2 = (name_map_long.get(t) or "").strip()
-            return nm2 if nm2 else t
-        else:
-            nm = (name_map_long.get(t) or "").strip()
-            if nm: return nm
-            nm2 = (name_map_short.get(t) or "").strip()
-            return nm2 if nm2 else t
+        nm_short = (name_map_short.get(t) or "").strip()
+        if nm_short:
+            return nm_short
+        nm_long = (name_map_long.get(t) or "").strip()
+        return nm_long if nm_long else t
 
     # 4) Benchmarks (séries + nomes)
     bench_series = {}
@@ -596,16 +612,11 @@ try:
 
     def get_bench_name(ticker: str, prefer_short: bool = True) -> str:
         t = str(ticker).strip()
-        if prefer_short:
-            nm = (bench_name_map_short.get(t) or "").strip()
-            if nm: return nm
-            nm2 = (bench_name_map_long.get(t) or "").strip()
-            return nm2 if nm2 else t
-        else:
-            nm = (bench_name_map_long.get(t) or "").strip()
-            if nm: return nm
-            nm2 = (bench_name_map_short.get(t) or "").strip()
-            return nm2 if nm2 else t
+        nm_short = (bench_name_map_short.get(t) or "").strip()
+        if nm_short:
+            return nm_short
+        nm_long = (bench_name_map_long.get(t) or "").strip()
+        return nm_long if nm_long else t
 
     # ------------------- ABAS -------------------
     tab_sel, tab_otm, tab_manual, tab_comp, tab_corr, tab_catalog = st.tabs(
@@ -824,11 +835,13 @@ try:
 
             portfolio_returns2 = (returns_sel * pesos_man).sum(axis=1)
             fig2, ax2 = plt.subplots(figsize=(5, 3.2))
-            (1 + portfolio_returns2).cumprod().plot(ax=ax2, label="Carteira", lw=2)
+            ((1 + portfolio_returns2).cumprod() - 1).plot(ax=ax2, label="Carteira", lw=2)
             if benchmark_retornos is not None and not getattr(benchmark_retornos, "empty", True):
                 port_alinh, bench_alinh = portfolio_returns2.align(benchmark_retornos, join="inner")
-                (1 + bench_alinh).cumprod().plot(ax=ax2, ls="--", lw=1.5, label=(benchmark_nome or "Benchmark"))
-            ax2.set_title("Evolução do Portfólio"); ax2.legend()
+                ((1 + bench_alinh).cumprod() - 1).plot(ax=ax2, ls="--", lw=1.5, label=(benchmark_nome or "Benchmark"))
+            percent_axis(ax2, 'y', 'unit')
+            ax2.set_title("Evolução do Portfólio (acumulado, %)")
+            ax2.legend(); ax2.grid(alpha=0.25, linewidth=0.6)
             st.pyplot(fig2)
 
             ann_return, ann_vol, sharpe, max_dd = indicadores_totais(portfolio_returns2, rf_daily)
@@ -854,6 +867,43 @@ try:
                                             "Sharpe":         [f"{sh_pm:.2f}", f"{sh_bm:.2f}"],
                                             "Máx DD":         [f"{dd_pm*100:.2f}%", f"{dd_bm*100:.2f}%"]})
                 st.dataframe(comp_manual, use_container_width=True)
+
+                # -------- Indicadores por ano — Carteira e Benchmark (empilhados) --------
+                st.subheader("📆 Indicadores por Ano — Carteira (Pesos Manuais)")
+                tab_port_ano = indicadores_por_ano(portfolio_returns2, rf_daily)
+                st.dataframe(tab_port_ano, use_container_width=True)
+
+                st.subheader(f"📆 Indicadores por Ano — {benchmark_nome or 'Benchmark'}")
+                port_alinh_y, bench_alinh_y = portfolio_returns2.align(benchmark_retornos, join="inner")
+                tab_bench_ano = indicadores_por_ano(bench_alinh_y, rf_daily)
+                st.dataframe(tab_bench_ano, use_container_width=True)
+
+                # (Opcional) Gráfico anual Carteira vs Benchmark
+                st.markdown("**Gráfico anual — Carteira vs Benchmark (opcional)**")
+                show_annual_chart = st.checkbox("Mostrar gráfico anual (Carteira vs Benchmark)",
+                                                key="manual_show_annual_chart", value=False)
+                if show_annual_chart:
+                    df_y = pd.DataFrame({"Carteira": port_alinh_y, "Benchmark": bench_alinh_y}).dropna()
+                    if not df_y.empty:
+                        df_y["Ano"] = df_y.index.year
+                        gy = df_y.groupby("Ano").apply(
+                            lambda g: pd.Series({
+                                "Carteira":  (1 + g["Carteira"]).prod()  - 1.0,
+                                "Benchmark": (1 + g["Benchmark"]).prod() - 1.0,
+                            })
+                        )
+                        anos = gy.index.astype(str)
+                        pos  = np.arange(len(anos))
+                        w    = 0.45
+                        figy, axy = plt.subplots(figsize=(6.8, 3.2))
+                        axy.bar(pos - w/2, gy["Carteira"].values, width=w, label="Carteira")
+                        axy.bar(pos + w/2, gy["Benchmark"].values, width=w, label=(benchmark_nome or "Benchmark"))
+                        axy.set_xticks(pos); axy.set_xticklabels(anos)
+                        percent_axis(axy, 'y', 'unit')
+                        axy.set_ylabel("Retorno (%)")
+                        axy.grid(axis="y", alpha=0.25, linewidth=0.6)
+                        axy.legend(loc="best", frameon=False)
+                        st.pyplot(figy)
 
     # 11) COMPARAR ATIVOS
     with tab_comp:
@@ -897,23 +947,19 @@ try:
             if ret_comp.empty:
                 st.warning("Não há dados válidos para os ativos selecionados.")
             else:
-                st.markdown("**Evolução acumulada (base = 1.0)**")
-                cum = (1 + ret_comp).cumprod()
-                figc, axc = plt.subplots(figsize=(3.2, 1.2)); figc.set_dpi(180)
+                st.markdown("**Evolução acumulada (%, base = 0%)**")
+                cum = (1 + ret_comp).cumprod() - 1
+                figc, axc = plt.subplots(figsize=(3.6, 1.4)); figc.set_dpi(180)
                 for c in cum.columns:
                     axc.plot(cum.index, cum[c], lw=1.0, label=get_name(c))
                 locator = mdates.AutoDateLocator(minticks=3, maxticks=6)
                 axc.xaxis.set_major_locator(locator)
                 axc.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
-                ymin, ymax = float(cum.min().min()), float(cum.max().max())
-                if not np.isfinite(ymin) or not np.isfinite(ymax) or ymin == ymax:
-                    ymin, ymax = 0.95, 1.05
-                axc.set_yticks(np.linspace(ymin, ymax, 3))
+                percent_axis(axc, 'y', 'unit')
                 axc.tick_params(axis="x", labelsize=8); axc.tick_params(axis="y", labelsize=8)
                 axc.margins(x=0); axc.grid(alpha=0.25, linewidth=0.5)
                 axc.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), fontsize=8, frameon=False, ncol=1, handlelength=1.6)
                 axc.set_xlabel(""); axc.set_ylabel(""); st.pyplot(figc)
-                # Tabela
                 linhas = []
                 for c in ativos_comp:
                     s = ret_comp[c].dropna()
@@ -935,12 +981,8 @@ try:
         macro_df = load_macro_flex(CAMINHO_MACRO)
 
         if macro_df is None:
-            st.info(
-                "Para ativar esta aba, crie **macro.xlsx** com uma coluna **Date** e colunas de macros como "
-                "`FEDL01 Index` (Fed Funds), `CPI XYOY Index`/`CPI YOY Index` (CPI YoY ou Core CPI YoY) e `DXY Index` (DXY)."
-            )
+            st.info("Crie **macro.xlsx** com Date + colunas de Fed/CPI/PCE/DXY (nomes flexíveis).")
         else:
-            # Preferências de inflação p/ Fed real
             infl_pref = None; infl_label = "Inflação YoY"
             if "cpi_core_yoy" in macro_df.columns: infl_pref, infl_label = "cpi_core_yoy", "Core CPI YoY (pp)"
             elif "pce_core_yoy" in macro_df.columns: infl_pref, infl_label = "pce_core_yoy", "Core PCE YoY (pp)"
@@ -964,7 +1006,6 @@ try:
                 var_label = st.selectbox("Variável macro", list(macro_opts.keys()))
                 var_col, var_kind = macro_opts[var_label]
 
-                # Séries mensais
                 ret_m = (1 + returns_sel).resample("M").prod() - 1
                 m_raw = macro_df[var_col].resample("M").last()
                 x_series = m_raw.pct_change() if var_kind == "pct" else m_raw
@@ -976,27 +1017,31 @@ try:
                 else:
                     all_asset_labels = [get_name(t) for t in ret_m.columns]
                     label_to_ticker  = {get_name(t): t for t in ret_m.columns}
-                    chosen_assets = st.multiselect("Ativos para plotar", all_asset_labels, all_asset_labels[:min(6, len(all_asset_labels))])
+                    chosen_assets = st.multiselect("Ativos para plotar", all_asset_labels,
+                                                   all_asset_labels[:min(6, len(all_asset_labels))])
 
                     if chosen_assets:
-                        # Scatter — controle do eixo X
+                        # Sliders de faixa + formatação em %
                         if var_kind == "level":
-                            if "CPI" in x_name or "Core CPI" in x_name:
-                                xmin, xmax = st.slider("Faixa do eixo X (CPI YoY, pp)",
+                            if "CPI" in x_name:
+                                xmin, xmax = st.slider("Faixa do eixo X (CPI YoY, %)",
                                                        min_value=0.0, max_value=max(10.0, float(np.ceil(base["X"].max()))),
                                                        value=(0.0, 10.0), step=0.1)
+                                mode_x = 'pp'
                             else:
                                 x_min_obs = float(np.floor(base["X"].min()))
                                 x_max_obs = float(np.ceil(base["X"].max()))
-                                xmin, xmax = st.slider("Faixa do eixo X (nível, pp)",
+                                xmin, xmax = st.slider("Faixa do eixo X (nível, %)",
                                                        min_value=min(0.0, x_min_obs), max_value=max(6.0, x_max_obs),
                                                        value=(min(0.0, x_min_obs), max(6.0, x_max_obs)), step=0.1)
+                                mode_x = 'pp'
                         else:
                             q5, q95 = np.percentile(base["X"].values, [5, 95])
                             pad = float(max(abs(q5), abs(q95)))
                             lim = float(np.ceil((pad + 0.01) * 100) / 100)
-                            xmin, xmax = st.slider("Faixa do eixo X (DXY, var.% mensal)",
+                            xmin, xmax = st.slider("Faixa do eixo X (DXY, var.% m/m)",
                                                    min_value=-lim, max_value=lim, value=(-lim, lim), step=0.001)
+                            mode_x = 'unit'
 
                         show_ols = st.checkbox("Mostrar linha de tendência (OLS)", value=False)
                         show_corr_table = st.checkbox("Mostrar tabela de correlação (ativo vs variável)", value=True)
@@ -1015,8 +1060,10 @@ try:
                                 except Exception:
                                     pass
                         ax.set_xlim(xmin, xmax)
-                        ax.set_xlabel(f"{x_name}" + (" (m/m, %)" if var_kind == "pct" else ""))
-                        ax.set_ylabel("Retorno mensal dos ativos")
+                        percent_axis(ax, 'x', mode_x)          # X em %
+                        percent_axis(ax, 'y', 'unit')          # retornos mensais em %
+                        ax.set_xlabel(f"{x_name}")
+                        ax.set_ylabel("Retorno mensal dos ativos (%)")
                         ax.axhline(0, lw=0.8, alpha=0.5)
                         ax.legend(loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False)
                         ax.grid(alpha=0.25, linewidth=0.6)
@@ -1041,17 +1088,17 @@ try:
                     with colm1:
                         bucket_method = st.radio("Método de balde", ["Faixas fixas", "Quantis"], index=0)
                     with colm2:
-                        metric_choice = st.selectbox("Métrica na tabela", ["Média (%)", "Vol (%)", "Hit Rate (%)", "Sharpe (m)", "Sharpe (a)"], index=0)
+                        metric_choice = st.selectbox("Métrica na tabela",
+                                                     ["Média (%)", "Vol (%)", "Hit Rate (%)", "Sharpe (m)", "Sharpe (a)"], index=0)
 
                     def default_edges():
-                        if var_kind == "pct":        # DXY
-                            return [-1.0, -0.02, -0.01, 0.0, 0.01, 0.02, 1.0]
+                        if var_kind == "pct":
+                            return [-1.0, -0.02, -0.01, 0.0, 0.01, 0.02, 1.0]  # fração (-100% a 100%)
                         else:
-                            if "CPI" in x_name:       # CPI
-                                return [0.0, 2.5, 3.5, 4.5, 6.0, 99.9]
-                            else:                     # Fed / Fed real
-                                return [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 99.9]
+                            if "CPI" in x_name: return [0.0, 2.5, 3.5, 4.5, 6.0, 99.9]  # já em %
+                            return [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 99.9]               # já em %
 
+                    # Regimes/Baldes — rótulos do X em %
                     if bucket_method == "Faixas fixas":
                         edges_str = st.text_input("Cortes (crescentes, vírgulas)",
                                                   value=",".join(str(e) for e in default_edges()))
@@ -1059,13 +1106,18 @@ try:
                             edges = [float(x.strip()) for x in edges_str.split(",") if x.strip() != ""]
                             edges = sorted(edges)
                         except Exception:
-                            st.error("Cortes inválidos. Usando padrão.")
-                            edges = default_edges()
+                            st.error("Cortes inválidos. Usando padrão."); edges = default_edges()
                         if len(edges) < 3:
                             st.warning("Poucos cortes; adicione mais pontos para formar faixas.")
-                        bins = edges
-                        labels = [f"{bins[i]:g}–{bins[i+1]:g}" for i in range(len(bins)-1)]
-                        Xb = pd.cut(base["X"], bins=bins, labels=labels, include_lowest=True, right=True)
+
+                        # Labels com % (fração -> %, nível -> %)
+                        if var_kind == "pct":
+                            labels = [make_bucket_label(edges[i], edges[i+1], 'pct') for i in range(len(edges)-1)]
+                        else:
+                            labels = [make_bucket_label(edges[i], edges[i+1], 'pp') for i in range(len(edges)-1)]
+
+                        Xb = pd.cut(base["X"], bins=edges, labels=labels, include_lowest=True, right=True)
+                        order_cols = labels[:]  # mantém a ordem dos rótulos
                     else:
                         q = st.slider("Número de quantis", min_value=3, max_value=10, value=4, step=1)
                         try:
@@ -1074,11 +1126,18 @@ try:
                             st.warning("Quantis indisponíveis (dados repetidos/insuficientes). Ajustando…")
                             Xb = pd.qcut(base["X"].rank(method="first"), q=q, duplicates="drop")
 
-                    # ===== Monta base com baldes — padroniza para __bucket__ =====
+                        # Renomeia categorias para % (ex.: (0.5%, 1.2%])
+                        if pd.api.types.is_categorical_dtype(Xb):
+                            cats = list(Xb.cat.categories)
+                            new_labels = [make_bucket_label(iv.left, iv.right, 'pct' if var_kind=='pct' else 'pp') for iv in cats]
+                            Xb = Xb.cat.rename_categories(new_labels)
+                            order_cols = new_labels[:]
+                        else:
+                            order_cols = [str(c) for c in sorted(pd.unique(Xb))]
+
+                    # Base + padronização de coluna de balde
                     base_b = base.copy()
                     base_b["__bucket__"] = Xb
-
-                    # Compatibilidade: se existir 'bucket', incorpora e remove
                     if "bucket" in base_b.columns:
                         mask_nan = base_b["__bucket__"].isna()
                         if mask_nan.any():
@@ -1090,7 +1149,6 @@ try:
                         st.warning("Sem observações após a aplicação dos baldes.")
                     else:
                         bucket_col = "__bucket__"
-
                         asset_cols = list(ret_m.columns)
 
                         def _metrics_by_bucket(df, asset_cols, bucket_col):
@@ -1127,40 +1185,30 @@ try:
                             col_m, scale = metric_map[metric_choice]
                             metr["_val"] = metr[col_m] * scale
 
-                            # Ordem dos baldes
-                            if pd.api.types.is_categorical_dtype(base_b[bucket_col]):
-                                order_cols = [str(c) for c in list(base_b[bucket_col].cat.categories)]
-                            else:
-                                order_cols = [str(c) for c in sorted(base_b[bucket_col].dropna().unique())]
-
                             piv = metr.pivot_table(index="asset_label", columns=bucket_col, values="_val", aggfunc="first")
-                            piv.columns = piv.columns.astype(str)
-                            piv = piv.reindex(columns=[str(c) for c in order_cols])
+                            # Garante ordem dos buckets conforme definimos
+                            piv = piv.reindex(columns=order_cols)
                             st.subheader("Tabela por baldes")
                             st.dataframe(piv.round(2), use_container_width=True)
 
                             csv = piv.round(4).to_csv().encode("utf-8")
                             st.download_button("⬇️ Baixar CSV da tabela", data=csv, file_name="regimes_pivot.csv", mime="text/csv")
 
-                            # ===== Barras por balde (sem usar .cat no índice) =====
                             st.markdown("**Barras por balde (métrica escolhida)**")
                             one_asset = st.selectbox("Ativo", sorted(metr["asset_label"].unique()))
                             sub = metr.loc[metr["asset_label"] == one_asset].copy()
 
-                            # Decide a ordem dos baldes (labels) como strings
-                            if pd.api.types.is_categorical_dtype(base_b[bucket_col]):
-                                order_labels = [str(c) for c in list(base_b[bucket_col].cat.categories)]
-                            else:
-                                order_labels = [str(c) for c in sorted(base_b[bucket_col].dropna().unique())]
-
-                            # Garante a mesma ordem dos baldes no gráfico, SEM usar .cat no index
+                            # Ordena pelo mesmo order_cols
                             sub = sub.set_index(bucket_col)
                             sub.index = sub.index.astype(str)
-                            sub = sub.reindex(order_labels).reset_index()
+                            sub = sub.reindex(order_cols).reset_index()
 
                             figb, axb = plt.subplots(figsize=(6.8, 3.6))
                             axb.bar(sub[bucket_col].astype(str), sub["_val"].values)
-                            axb.set_xlabel("Balde/regime"); axb.set_ylabel(metric_choice)
+                            axb.set_xlabel("Balde/regime")
+                            axb.set_ylabel(metric_choice)
+                            if metric_choice in ["Média (%)", "Vol (%)", "Hit Rate (%)"]:
+                                percent_axis(axb, 'y', 'pp')  # valores estão em 0..100
                             axb.grid(alpha=0.25, linewidth=0.6, axis="y")
                             plt.setp(axb.get_xticklabels(), rotation=0, ha="center")
                             st.pyplot(figb)
